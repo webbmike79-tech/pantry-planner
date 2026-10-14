@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>🥘 Pantry Planner</title>
+<meta name="theme-color" content="#16121d">
+<link rel="manifest" href="manifest.json">
+<link rel="icon" href="icon-192.png" type="image/png">
+<link rel="apple-touch-icon" href="icon-192.png">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<!-- ===== First-run Gemini key setup (shown when no key is stored) ===== -->
+<div id="setup-screen" class="setup-overlay" hidden>
+  <div class="setup-card">
+    <div class="setup-emoji">🔑</div>
+    <h2>One quick setup</h2>
+    <p>This app runs on Google's <b>free</b> Gemini AI. Grab your free key once —
+       takes about 30 seconds, <b>no credit card</b>.</p>
+    <a class="btn btn-primary btn-big" href="https://aistudio.google.com/apikey"
+       target="_blank" rel="noopener">🔑 Get My Free Gemini Key</a>
+    <label class="field-label" for="setup-key-input">Then paste your key here:</label>
+    <input id="setup-key-input" type="password" placeholder="Paste your Gemini API key"
+           autocomplete="off" autocapitalize="off" spellcheck="false">
+    <button id="setup-save-btn" class="btn btn-primary btn-big">Save &amp; Connect</button>
+    <p id="setup-msg" class="form-msg" role="status"></p>
+    <button id="setup-skip-btn" class="btn btn-ghost">Browse without a key
+      <small>(photo scans &amp; menu generation need one)</small></button>
+  </div>
+</div>
+
+<header class="app-header">
+  <h1>🥘 Pantry Planner</h1>
+  <div class="banner">🎃 Spooky Harvest Kitchen Mode</div>
+  <div class="status-bar">
+    <div class="stat"><span class="stat-num" id="stat-stock">0</span><span class="stat-label">📦 Stocked</span></div>
+    <div class="stat"><span class="stat-num" id="stat-headcount">–</span><span class="stat-label">👨‍👩‍👧 People</span></div>
+    <div class="stat"><span class="stat-num" id="stat-cooked">0/7</span><span class="stat-label">🍳 Cooked</span></div>
+    <div class="stat"><span class="stat-num" id="stat-tobuy">0</span><span class="stat-label">🛒 To Buy</span></div>
+  </div>
+</header>
+
+<main>
+  <!-- ===== Tab 1: Scan & Stock ===== -->
+  <section id="tab-scan" class="tab-page active">
+    <h2>📸 Snap or Upload Shelves</h2>
+    <div class="card">
+      <div class="segmented" id="scan-location">
+        <button data-loc="Fridge" class="active">Fridge</button>
+        <button data-loc="Freezer">Freezer</button>
+        <button data-loc="Cupboard / Pantry">Pantry</button>
+      </div>
+      <label class="btn btn-primary file-btn">
+        📷 Take / Choose Photo
+        <input id="scan-file" type="file" accept="image/*" capture="environment" hidden>
+      </label>
+      <p class="file-name" id="scan-file-name">No photo chosen yet</p>
+      <img id="scan-preview" class="photo-preview" alt="Shelf photo preview" hidden>
+      <button id="scan-btn" class="btn btn-accent" disabled>🔍 Scan Photo &amp; Log Items</button>
+      <p class="form-msg" id="scan-msg" role="status"></p>
+    </div>
+
+    <h2>📦 Kitchen Inventory</h2>
+    <div class="card">
+      <div id="inventory-list"></div>
+      <p class="empty-note" id="inventory-empty">Nothing stocked yet — scan a shelf photo or add items by hand.</p>
+      <div class="btn-row">
+        <button id="inv-add-btn" class="btn">➕ Add Item</button>
+        <button id="inv-save-btn" class="btn btn-primary">💾 Save Inventory</button>
+      </div>
+      <button id="inv-clear-btn" class="btn btn-danger">🗑️ Clear All Inventory</button>
+      <p class="form-msg" id="inv-msg" role="status"></p>
+    </div>
+  </section>
+
+  <!-- ===== Tab 2: Household & Diet ===== -->
+  <section id="tab-diet" class="tab-page">
+    <h2>👨‍👩‍👧 Household Size &amp; Scaling</h2>
+    <div class="card">
+      <label class="field-label" for="base-headcount">Standard Household Headcount</label>
+      <input id="base-headcount" type="number" min="1" max="50" value="2">
+      <p class="hint">Scale individual days for guests or holidays (e.g., 20 for Thanksgiving).</p>
+      <div class="day-grid" id="day-headcounts"></div>
+    </div>
+
+    <h2>🥗 Dietary Restrictions &amp; Allergies</h2>
+    <div class="card">
+      <div id="diet-tags" class="tag-list"></div>
+      <label class="field-label" for="custom-notes">Specific Medical Needs, Allergies, or Favorite Cuisines</label>
+      <textarea id="custom-notes" rows="3" placeholder="e.g., Type 2 diabetes for one member, severe peanut allergy for another, prefer Tex-Mex or German cuisine."></textarea>
+      <label class="field-label" for="staples">Essential Staples to Always Check (Seasonings, Drinks, Veggies)</label>
+      <textarea id="staples" rows="2"></textarea>
+      <button id="diet-save-btn" class="btn btn-primary">💾 Save Household &amp; Diet Settings</button>
+      <p class="form-msg" id="diet-msg" role="status"></p>
+    </div>
+
+    <h2>🔑 Gemini API Key</h2>
+    <div class="card">
+      <p class="hint">Your key is stored <b>only on this device</b> and is sent only to Google
+        (through this app's backend) when you scan a photo or generate a menu. It is never logged.
+        Need a key? <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">Get one free here</a> — no credit card.</p>
+      <label class="field-label" for="settings-key-input">Gemini API Key</label>
+      <input id="settings-key-input" type="password" placeholder="Paste a Gemini API key"
+             autocomplete="off" autocapitalize="off" spellcheck="false">
+      <button id="settings-key-btn" class="btn btn-primary">Save &amp; Connect</button>
+      <p class="form-msg" id="settings-key-msg" role="status"></p>
+    </div>
+  </section>
+
+  <!-- ===== Tab 3: Weekly Menu ===== -->
+  <section id="tab-menu" class="tab-page">
+    <h2>📅 7-Day Menu &amp; Recipes</h2>
+    <button id="generate-btn" class="btn btn-primary btn-big">🚀 Generate 7-Day Menu &amp; Recipes</button>
+    <p class="form-msg" id="menu-msg" role="status"></p>
+    <p class="hint" id="plan-meta"></p>
+    <div id="nutrition-notes" class="info-box" hidden></div>
+    <div id="menu-days"></div>
+    <p class="empty-note" id="menu-empty">No menu generated yet. Stock your shelves, then tap Generate.</p>
+  </section>
+
+  <!-- ===== Tab 4: Shopping & Receipts ===== -->
+  <section id="tab-shop" class="tab-page">
+    <h2>🛒 Smart Shopping Checklist</h2>
+    <div class="card">
+      <div id="shopping-list"></div>
+      <p class="empty-note" id="shopping-empty">Generate a weekly menu first to populate your shopping list.</p>
+      <button id="restock-btn" class="btn btn-primary" disabled>📥 Add Checked Items to Inventory</button>
+      <p class="form-msg" id="shop-msg" role="status"></p>
+      <hr class="sep">
+      <label class="check-line">
+        <input type="checkbox" id="export-include"> Include already-restocked items in export
+      </label>
+      <button id="export-btn" class="btn">⬇️ Download Shopping List (.md)</button>
+    </div>
+
+    <h2>🧾 Scan Grocery Receipt</h2>
+    <div class="card">
+      <p class="hint">Snap your paper receipt to auto-restock your kitchen and check off your list.</p>
+      <label class="btn btn-primary file-btn">
+        📷 Take / Choose Receipt Photo
+        <input id="receipt-file" type="file" accept="image/*" capture="environment" hidden>
+      </label>
+      <p class="file-name" id="receipt-file-name">No photo chosen yet</p>
+      <img id="receipt-preview" class="photo-preview" alt="Receipt photo preview" hidden>
+      <button id="receipt-btn" class="btn btn-accent" disabled>🧾 Scan Receipt &amp; Auto-Restock</button>
+      <p class="form-msg" id="receipt-msg" role="status"></p>
+      <div id="receipt-logs"></div>
+    </div>
+  </section>
+</main>
+
+<nav class="tabbar">
+  <button data-tab="tab-scan" class="active"><span class="tab-emoji">📸</span><span>Scan</span></button>
+  <button data-tab="tab-diet"><span class="tab-emoji">👨‍👩‍👧</span><span>Diet</span></button>
+  <button data-tab="tab-menu"><span class="tab-emoji">📅</span><span>Menu</span></button>
+  <button data-tab="tab-shop"><span class="tab-emoji">🛒</span><span>Shop</span></button>
+</nav>
+
+<div id="toast" role="status"></div>
+
+<script src="app.js"></script>
+</body>
+</html>
