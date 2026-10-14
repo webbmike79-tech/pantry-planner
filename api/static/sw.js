@@ -1,5 +1,5 @@
 /* Pantry Planner service worker — cache-first app shell, network-only API. */
-const CACHE = "pantry-planner-v1";
+const CACHE = "pantry-planner-v2";
 const SHELL = [
   "/",
   "/index.html",
