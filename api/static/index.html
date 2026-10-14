@@ -135,16 +135,28 @@
       <button id="export-btn" class="btn">⬇️ Download Shopping List (.md)</button>
     </div>
 
-    <h2>🧾 Scan Grocery Receipt</h2>
+    <h2>🧾 Scan Receipt / Import Online Order</h2>
     <div class="card">
-      <p class="hint">Snap your paper receipt to auto-restock your kitchen and check off your list.</p>
+      <p class="hint">Snap your paper receipt — or import an online order — to auto-restock your kitchen and check off your list.</p>
       <label class="btn btn-primary file-btn">
-        📷 Take / Choose Receipt Photo
-        <input id="receipt-file" type="file" accept="image/*" capture="environment" hidden>
+        📷 Take / Choose Receipt Photos / Screenshots
+        <input id="receipt-file" type="file" accept="image/*" capture="environment" multiple hidden>
       </label>
-      <p class="file-name" id="receipt-file-name">No photo chosen yet</p>
+      <p class="file-name" id="receipt-file-name">No photos chosen yet</p>
       <img id="receipt-preview" class="photo-preview" alt="Receipt photo preview" hidden>
       <button id="receipt-btn" class="btn btn-accent" disabled>🧾 Scan Receipt &amp; Auto-Restock</button>
+      <hr class="sep">
+      <p class="hint">Ordered online? Import the order PDF instead:</p>
+      <label class="btn file-btn">
+        📄 Choose Order PDF
+        <input id="receipt-pdf-file" type="file" accept="application/pdf" hidden>
+      </label>
+      <p class="file-name" id="receipt-pdf-name">No PDF chosen yet</p>
+      <button id="receipt-pdf-btn" class="btn btn-accent" disabled>📄 Import PDF &amp; Auto-Restock</button>
+      <hr class="sep">
+      <p class="hint">…or paste the order confirmation text / email:</p>
+      <textarea id="receipt-paste-text" rows="5" placeholder="Paste your online order confirmation text here…"></textarea>
+      <button id="receipt-paste-btn" class="btn btn-accent">📋 Import Pasted Order</button>
       <p class="form-msg" id="receipt-msg" role="status"></p>
       <div id="receipt-logs"></div>
     </div>
