@@ -3,6 +3,14 @@
 
 const KEY_STORAGE = "gemini_api_key";
 const HC_STORAGE = "daily_headcounts";
+const SERVER_URL_STORAGE = "pantry_server_url";
+const ACCESS_TOKEN_STORAGE = "pantry_access_token";
+const CACHE_INV_STORAGE = "pantry_cache_inventory";
+const CACHE_SETTINGS_STORAGE = "pantry_cache_settings";
+const CACHE_PLAN_STORAGE = "pantry_cache_plan";
+const CACHE_TIME_STORAGE = "pantry_cache_time";
+const OUTBOX_STORAGE = "pantry_outbox";
+const SYNCED_IDS_STORAGE = "pantry_synced_client_ids";
 
 const LOCATIONS = ["Fridge", "Freezer", "Cupboard / Pantry"];
 const CATEGORIES = [
@@ -32,6 +40,11 @@ const state = {
   scanLocation: "Fridge",
 };
 
+let connectionState = "CONNECTING"; // "CONNECTED" | "CONNECTING" | "DISCONNECTED" | "AUTH_REQUIRED"
+let lastSyncTime = localStorage.getItem(CACHE_TIME_STORAGE) || "";
+let heartbeatTimer = null;
+let isFlushingOutbox = false;
+
 const $ = (sel) => document.querySelector(sel);
 
 function esc(s) {
@@ -43,6 +56,7 @@ function esc(s) {
 let toastTimer = null;
 function toast(msg) {
   const t = $("#toast");
+  if (!t) return;
   t.textContent = msg;
   t.classList.add("show");
   clearTimeout(toastTimer);
@@ -50,11 +64,12 @@ function toast(msg) {
 }
 
 function setMsg(el, text, kind) {
+  if (!el) return;
   el.textContent = text || "";
   el.className = "form-msg" + (kind ? " " + kind : "");
 }
 
-/* ---------------- Gemini key handling ---------------- */
+/* ---------------- Storage helpers ---------------- */
 
 function storedKey() {
   return localStorage.getItem(KEY_STORAGE) || "";
@@ -63,10 +78,284 @@ function hasKey() {
   return storedKey().length > 0;
 }
 
+function storedServerUrl() {
+  return (localStorage.getItem(SERVER_URL_STORAGE) || "").trim().replace(/\/+$/, "");
+}
+
+function storedAccessToken() {
+  return (localStorage.getItem(ACCESS_TOKEN_STORAGE) || "").trim();
+}
+
+function isCapacitor() {
+  return typeof window.Capacitor !== "undefined" || window.location.protocol === "capacitor:";
+}
+
+function buildUrl(path) {
+  const base = storedServerUrl();
+  const cleanPath = path.startsWith("/") ? path : "/" + path;
+  return base ? `${base}${cleanPath}` : cleanPath;
+}
+
+/* ---------------- Connection & State Machine ---------------- */
+
+function isOnline() {
+  return connectionState === "CONNECTED";
+}
+
+function updateConnectionUI() {
+  const banner = $("#connection-banner");
+  const bannerText = $("#banner-text");
+  const bannerIcon = $("#banner-icon");
+  const dot = $("#server-status-dot");
+  const statusText = $("#server-status-text");
+  const serverUrl = storedServerUrl();
+  const hostLabel = serverUrl ? serverUrl.replace(/^https?:\/\//, "") : (isCapacitor() ? "Home Server" : "local server");
+
+  if (banner) banner.className = "connection-banner";
+  if (dot) dot.className = "status-dot";
+
+  if (connectionState === "CONNECTED") {
+    if (banner) banner.hidden = true;
+    if (dot) dot.classList.add("connected");
+    if (statusText) statusText.textContent = `Connected (${hostLabel})`;
+  } else if (connectionState === "CONNECTING") {
+    if (banner) banner.hidden = true;
+    if (dot) dot.classList.add("connecting");
+    if (statusText) statusText.textContent = "Connecting…";
+  } else if (connectionState === "AUTH_REQUIRED") {
+    if (banner) {
+      banner.hidden = false;
+      banner.classList.add("auth-err");
+    }
+    if (bannerIcon) bannerIcon.textContent = "🔒";
+    if (bannerText) bannerText.textContent = `Access code required for ${hostLabel}. Set it in Settings.`;
+    if (dot) dot.classList.add("auth");
+    if (statusText) statusText.textContent = "Access code required / incorrect";
+  } else {
+    // DISCONNECTED
+    if (banner) {
+      banner.hidden = false;
+    }
+    if (bannerIcon) bannerIcon.textContent = "⚠️";
+    const timeNote = lastSyncTime ? ` Showing cached data from ${lastSyncTime}.` : " Reconnecting…";
+    if (bannerText) bannerText.textContent = `Disconnected from ${hostLabel}.${timeNote}`;
+    if (dot) dot.classList.add("disconnected");
+    if (statusText) statusText.textContent = `Disconnected (${hostLabel})`;
+  }
+}
+
+function setConnectionState(newState, detail) {
+  const oldState = connectionState;
+  connectionState = newState;
+  updateConnectionUI();
+
+  if (oldState !== "CONNECTED" && newState === "CONNECTED") {
+    toast("Connected to Home Server ✅");
+    flushOutbox();
+  }
+}
+
+async function probeHealth(serverUrl, token) {
+  const base = (serverUrl || "").trim().replace(/\/+$/, "");
+  const target = (base ? base : "") + "/health";
+  const headers = {};
+  if (token) headers["X-Pantry-Token"] = token;
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 4000);
+  try {
+    const res = await fetch(target, { method: "GET", headers, signal: controller.signal });
+    clearTimeout(timeoutId);
+    if (res.status === 401) {
+      return { ok: false, authRequired: true, error: "Access code required or incorrect." };
+    }
+    if (!res.ok) {
+      return { ok: false, error: `Server returned error (${res.status}).` };
+    }
+    const data = await res.json();
+    if (data.status === "ok" && (data.app === "pantry-planner" || data.status === "ok")) {
+      return { ok: true, authRequired: data.auth_required || false };
+    }
+    return { ok: false, error: "Connected, but server is not Pantry Planner." };
+  } catch (err) {
+    clearTimeout(timeoutId);
+    if (err.name === "AbortError") {
+      return { ok: false, error: "Connection timed out. Check IP and Wi-Fi." };
+    }
+    return { ok: false, error: `Could not reach server: ${err.message}` };
+  }
+}
+
+async function checkHeartbeat() {
+  const result = await probeHealth(storedServerUrl(), storedAccessToken());
+  if (result.ok) {
+    if (connectionState !== "CONNECTED") {
+      setConnectionState("CONNECTED");
+      refreshAll(true);
+    }
+  } else if (result.authRequired) {
+    setConnectionState("AUTH_REQUIRED");
+  } else {
+    if (connectionState === "CONNECTED") {
+      setConnectionState("DISCONNECTED");
+    }
+  }
+}
+
+function startHeartbeat() {
+  if (heartbeatTimer) clearInterval(heartbeatTimer);
+  heartbeatTimer = setInterval(() => {
+    if (document.visibilityState === "visible") {
+      checkHeartbeat();
+    }
+  }, 15000);
+}
+
+/* ---------------- Offline Cache & Outbox Queue ---------------- */
+
+function loadFromOfflineCache() {
+  try {
+    const cachedInv = localStorage.getItem(CACHE_INV_STORAGE);
+    if (cachedInv) state.inventory = JSON.parse(cachedInv);
+    const cachedSettings = localStorage.getItem(CACHE_SETTINGS_STORAGE);
+    if (cachedSettings) state.settings = JSON.parse(cachedSettings);
+    const cachedPlan = localStorage.getItem(CACHE_PLAN_STORAGE);
+    if (cachedPlan) {
+      const p = JSON.parse(cachedPlan);
+      state.planId = p.plan_id;
+      state.planCreatedAt = p.created_at;
+      state.plan = p.plan;
+    }
+    lastSyncTime = localStorage.getItem(CACHE_TIME_STORAGE) || "";
+  } catch (e) {
+    console.error("Failed parsing offline cache:", e);
+  }
+}
+
+function saveToOfflineCache(inv, settings, latest) {
+  try {
+    const nowStr = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    lastSyncTime = nowStr;
+    localStorage.setItem(CACHE_INV_STORAGE, JSON.stringify(inv));
+    localStorage.setItem(CACHE_SETTINGS_STORAGE, JSON.stringify(settings));
+    localStorage.setItem(CACHE_PLAN_STORAGE, JSON.stringify(latest));
+    localStorage.setItem(CACHE_TIME_STORAGE, nowStr);
+  } catch (e) {
+    console.warn("Failed saving to offline cache:", e);
+  }
+}
+
+function getOutbox() {
+  try { return JSON.parse(localStorage.getItem(OUTBOX_STORAGE) || "[]"); } catch (e) { return []; }
+}
+
+function saveOutbox(items) {
+  localStorage.setItem(OUTBOX_STORAGE, JSON.stringify(items));
+  renderOutboxStatus();
+}
+
+function getSyncedIds() {
+  try { return new Set(JSON.parse(localStorage.getItem(SYNCED_IDS_STORAGE) || "[]")); } catch (e) { return new Set(); }
+}
+
+function markSyncedId(id) {
+  const ids = getSyncedIds();
+  ids.add(id);
+  const arr = Array.from(ids).slice(-100);
+  localStorage.setItem(SYNCED_IDS_STORAGE, JSON.stringify(arr));
+}
+
+function renderOutboxStatus() {
+  const outbox = getOutbox();
+  const card = $("#outbox-status-card");
+  const count = $("#outbox-count");
+  if (card && count) {
+    count.textContent = outbox.length;
+    card.hidden = outbox.length === 0;
+  }
+}
+
+async function flushOutbox() {
+  if (isFlushingOutbox || !isOnline()) return;
+  const outbox = getOutbox();
+  if (!outbox.length) return;
+
+  isFlushingOutbox = true;
+  const remaining = [];
+  let count = 0;
+
+  for (const item of outbox) {
+    const synced = getSyncedIds();
+    if (synced.has(item.client_id)) continue;
+    try {
+      await api("/api/inventory", {
+        method: "POST",
+        body: {
+          location: item.location,
+          items: [{
+            item_name: item.item_name,
+            category: item.category,
+            quantity: item.quantity,
+            unit: item.unit,
+          }],
+        },
+      });
+      markSyncedId(item.client_id);
+      count++;
+    } catch (e) {
+      console.warn("Failed syncing item from outbox:", item, e);
+      remaining.push(item);
+    }
+  }
+
+  saveOutbox(remaining);
+  isFlushingOutbox = false;
+  if (count > 0) {
+    toast(`Synced ${count} queued item${count === 1 ? "" : "s"} to Home Server! ✅`);
+    try {
+      const inv = await api("/api/inventory");
+      state.inventory = inv;
+      localStorage.setItem(CACHE_INV_STORAGE, JSON.stringify(inv));
+      renderInventory();
+    } catch (e) {}
+  }
+}
+
+function queueOfflineAdd(item) {
+  const clientId = "outbox_" + Date.now() + "_" + Math.floor(Math.random() * 100000);
+  const outbox = getOutbox();
+  outbox.push({
+    client_id: clientId,
+    item_name: item.item_name,
+    quantity: item.quantity,
+    unit: item.unit,
+    location: item.location,
+    category: item.category,
+    created_at: new Date().toISOString(),
+  });
+  saveOutbox(outbox);
+
+  const localItem = Object.assign({}, item, {
+    id: -1 * (outbox.length),
+    _isQueued: true,
+    client_id: clientId,
+  });
+  state.inventory.unshift(localItem);
+  localStorage.setItem(CACHE_INV_STORAGE, JSON.stringify(state.inventory));
+  renderInventory();
+  toast("Added to offline queue (will sync when home) 📦");
+}
+
+/* ---------------- Gemini key handling ---------------- */
+
 async function validateKey(candidate) {
-  const res = await fetch("/api/validate-key", {
+  const headers = { "X-Gemini-Key": candidate };
+  const token = storedAccessToken();
+  if (token) headers["X-Pantry-Token"] = token;
+  const url = buildUrl("/api/validate-key");
+  const res = await fetch(url, {
     method: "POST",
-    headers: { "X-Gemini-Key": candidate },
+    headers,
   });
   let data = {};
   try { data = await res.json(); } catch (e) { /* non-JSON */ }
@@ -103,11 +392,35 @@ async function saveKeyWithValidation(inputEl, msgEl, onSuccess) {
 function showSetup() { $("#setup-screen").hidden = false; }
 function hideSetup() { $("#setup-screen").hidden = true; }
 
+function showServerSetup() { $("#server-setup-screen").hidden = false; }
+function hideServerSetup() { $("#server-setup-screen").hidden = true; }
+
+function showAddItemModal() {
+  const modal = $("#add-item-modal");
+  if (!modal) return;
+  $("#add-item-name").value = "";
+  $("#add-item-qty").value = "1";
+  $("#add-item-unit").value = "count";
+  $("#add-item-loc").value = state.scanLocation || "Cupboard / Pantry";
+  modal.hidden = false;
+  setTimeout(() => $("#add-item-name").focus(), 100);
+}
+function hideAddItemModal() {
+  const modal = $("#add-item-modal");
+  if (modal) modal.hidden = true;
+}
+
 function requireKey() {
   if (hasKey()) return true;
   showSetup();
   toast("Add your free Gemini key first 🔑");
   return false;
+}
+
+function switchToTab(tabId) {
+  document.querySelectorAll(".tabbar button").forEach((b) => b.classList.toggle("active", b.dataset.tab === tabId));
+  document.querySelectorAll(".tab-page").forEach((p) => p.classList.toggle("active", p.id === tabId));
+  window.scrollTo({ top: 0 });
 }
 
 /* ---------------- API helper ---------------- */
@@ -116,12 +429,29 @@ async function api(path, opts = {}) {
   const headers = Object.assign({}, opts.headers || {});
   const key = storedKey();
   if (key) headers["X-Gemini-Key"] = key;
+  const token = storedAccessToken();
+  if (token) headers["X-Pantry-Token"] = token;
+
   let body = opts.body;
   if (body && !(body instanceof FormData)) {
     headers["Content-Type"] = "application/json";
     body = JSON.stringify(body);
   }
-  const res = await fetch(path, { method: opts.method || "GET", headers, body });
+
+  const url = buildUrl(path);
+  let res;
+  try {
+    res = await fetch(url, { method: opts.method || "GET", headers, body });
+  } catch (err) {
+    setConnectionState("DISCONNECTED", err.message);
+    throw new Error(`Cannot reach server at ${storedServerUrl() || "local"}. You appear to be offline.`);
+  }
+
+  if (res.status === 401) {
+    setConnectionState("AUTH_REQUIRED", "Access code required or invalid.");
+    throw new Error("Access code required or invalid. Check Desktop Server settings.");
+  }
+
   if (!res.ok) {
     let msg = `Request failed (${res.status})`;
     try {
@@ -130,6 +460,11 @@ async function api(path, opts = {}) {
     } catch (e) { /* keep default */ }
     throw new Error(msg);
   }
+
+  if (connectionState !== "CONNECTED") {
+    setConnectionState("CONNECTED");
+  }
+
   const ct = res.headers.get("content-type") || "";
   return ct.includes("application/json") ? res.json() : res.text();
 }
@@ -152,19 +487,26 @@ function renderStatus() {
 
 function inventoryRow(item) {
   const row = document.createElement("div");
-  row.className = "inv-row";
+  row.className = "inv-row" + (item._isQueued ? " queued-row" : "");
   if (item.id != null) row.dataset.id = item.id;
+  if (item._isQueued) row.dataset.queued = "1";
+
   const locOpts = LOCATIONS.map(
     (l) => `<option ${l === item.location ? "selected" : ""}>${esc(l)}</option>`).join("");
   const catOpts = CATEGORIES.map(
     (c) => `<option ${c === item.category ? "selected" : ""}>${esc(c)}</option>`).join("");
+  
+  const queuedBadge = item._isQueued ? '<span class="badge-queued">Queued</span>' : "";
+
   row.innerHTML = `
     <input class="inv-name" type="text" placeholder="Item name" value="${esc(item.item_name || "")}">
+    ${queuedBadge}
     <input class="inv-qty" type="number" min="0" step="0.5" value="${item.quantity ?? 0}">
     <input class="inv-unit" type="text" placeholder="unit" value="${esc(item.unit || "count")}">
     <select class="inv-loc">${locOpts}</select>
     <select class="inv-cat">${catOpts}</select>
     <button class="inv-del" title="Remove item" aria-label="Remove item">✕</button>`;
+  
   row.querySelector(".inv-del").addEventListener("click", () => row.remove());
   return row;
 }
@@ -191,14 +533,54 @@ function collectInventoryRows() {
 
 async function saveInventory() {
   const msg = $("#inv-msg");
+  if (!isOnline()) {
+    setMsg(msg, "Bulk editing is disabled while offline to prevent overwriting changes. Use ➕ Add Item to queue new additions.", "err");
+    toast("⚠️ Reconnect to Home Server to save bulk edits.");
+    return;
+  }
   try {
     const data = await api("/api/inventory", { method: "PUT", body: collectInventoryRows() });
     state.inventory = data.inventory;
+    localStorage.setItem(CACHE_INV_STORAGE, JSON.stringify(data.inventory));
     renderInventory();
     setMsg(msg, "✅ Inventory saved.", "ok");
     toast("Inventory updated!");
   } catch (e) {
     setMsg(msg, e.message, "err");
+  }
+}
+
+async function submitAddItem() {
+  const name = $("#add-item-name").value.trim();
+  if (!name) {
+    alert("Please enter an item name.");
+    return;
+  }
+  const qty = parseFloat($("#add-item-qty").value) || 1;
+  const unit = $("#add-item-unit").value.trim() || "count";
+  const loc = $("#add-item-loc").value || state.scanLocation || "Cupboard / Pantry";
+  const cat = $("#add-item-cat").value || "Pantry/Dry";
+
+  const item = { item_name: name, quantity: qty, unit: unit, location: loc, category: cat };
+
+  hideAddItemModal();
+
+  if (isOnline()) {
+    try {
+      const data = await api("/api/inventory", {
+        method: "POST",
+        body: { location: loc, items: [item] },
+      });
+      state.inventory = data.inventory;
+      localStorage.setItem(CACHE_INV_STORAGE, JSON.stringify(data.inventory));
+      renderInventory();
+      toast(`Added ${name} to ${loc}! ✅`);
+    } catch (e) {
+      // If it failed unexpectedly, fall back to offline queue
+      queueOfflineAdd(item);
+    }
+  } else {
+    queueOfflineAdd(item);
   }
 }
 
@@ -253,6 +635,11 @@ function collectDailyHeadcounts() {
 
 async function saveDiet() {
   const msg = $("#diet-msg");
+  if (!isOnline()) {
+    setMsg(msg, "Cannot update household diet settings while offline.", "err");
+    toast("⚠️ Reconnect to Home Server to save settings.");
+    return;
+  }
   const body = {
     base_headcount: parseInt($("#base-headcount").value, 10) || 1,
     dietary_tags: Array.from(document.querySelectorAll("#diet-tags input:checked")).map((cb) => cb.value),
@@ -261,6 +648,7 @@ async function saveDiet() {
   };
   try {
     state.settings = await api("/api/settings", { method: "PUT", body });
+    localStorage.setItem(CACHE_SETTINGS_STORAGE, JSON.stringify(state.settings));
     collectDailyHeadcounts();
     renderStatus();
     setMsg(msg, "✅ Household dietary preferences saved!", "ok");
@@ -268,6 +656,54 @@ async function saveDiet() {
   } catch (e) {
     setMsg(msg, e.message, "err");
   }
+}
+
+/* ---------------- Server Settings (Tab 2) ---------------- */
+
+async function testServerConnection() {
+  const urlInput = $("#server-url-input");
+  const tokenInput = $("#server-token-input");
+  const msg = $("#server-msg");
+  const url = (urlInput.value || "").trim();
+  const token = (tokenInput.value || "").trim();
+
+  setMsg(msg, "Testing connection to server…");
+  const res = await probeHealth(url, token);
+  if (res.ok) {
+    setMsg(msg, "✅ Connection successful! Server is ready.", "ok");
+  } else if (res.authRequired) {
+    setMsg(msg, `🔒 ${res.error}`, "err");
+  } else {
+    setMsg(msg, `❌ ${res.error}`, "err");
+  }
+}
+
+async function saveServerSettings() {
+  const urlInput = $("#server-url-input");
+  const tokenInput = $("#server-token-input");
+  const msg = $("#server-msg");
+  let url = (urlInput.value || "").trim().replace(/\/+$/, "");
+  const token = (tokenInput.value || "").trim();
+
+  if (url && !url.startsWith("http://") && !url.startsWith("https://")) {
+    url = "http://" + url;
+    urlInput.value = url;
+  }
+
+  setMsg(msg, "Connecting…");
+  const res = await probeHealth(url, token);
+  if (!res.ok) {
+    setMsg(msg, `❌ Cannot connect: ${res.error}`, "err");
+    return;
+  }
+
+  localStorage.setItem(SERVER_URL_STORAGE, url);
+  localStorage.setItem(ACCESS_TOKEN_STORAGE, token);
+  setMsg(msg, "✅ Connected and saved!", "ok");
+  toast("Connected to Home Server ✅");
+
+  setConnectionState("CONNECTED");
+  refreshAll();
 }
 
 /* ---------------- Menu (Tab 3) ---------------- */
@@ -321,6 +757,11 @@ function renderMenu() {
 
 async function generatePlan() {
   if (!requireKey()) return;
+  if (!isOnline()) {
+    toast("⚠️ Menu generation requires connection to your Home Server.");
+    setMsg($("#menu-msg"), "Menu generation requires a live connection to your Home Server and Gemini AI.", "err");
+    return;
+  }
   const msg = $("#menu-msg");
   const btn = $("#generate-btn");
   btn.disabled = true;
@@ -333,6 +774,7 @@ async function generatePlan() {
     state.planId = data.plan_id;
     state.planCreatedAt = data.created_at;
     state.plan = data.plan;
+    localStorage.setItem(CACHE_PLAN_STORAGE, JSON.stringify(data));
     renderMenu();
     renderShopping();
     setMsg(msg, "✅ Weekly Menu & Recipes ready!", "ok");
@@ -344,11 +786,21 @@ async function generatePlan() {
 }
 
 async function cookDay(dayIndex) {
+  if (!isOnline()) {
+    toast("⚠️ Cooking updates inventory and requires connection to your Home Server.");
+    return;
+  }
   try {
     const data = await api("/api/plan/cook", { method: "POST", body: { day_index: dayIndex } });
     state.plan = data.plan;
     state.planCreatedAt = data.created_at;
     state.inventory = data.inventory;
+    localStorage.setItem(CACHE_PLAN_STORAGE, JSON.stringify({
+      plan_id: state.planId,
+      created_at: state.planCreatedAt,
+      plan: state.plan,
+    }));
+    localStorage.setItem(CACHE_INV_STORAGE, JSON.stringify(state.inventory));
     renderMenu();
     renderInventory();
     toast(data.deducted && data.deducted.length
@@ -403,9 +855,51 @@ function updateRestockBtn() {
   const btn = $("#restock-btn");
   btn.disabled = n === 0;
   btn.textContent = `📥 Add Checked Items (${n}) to Kitchen Inventory`;
+  updateClearPurchasedBtn();
+}
+
+function purchasedCount() {
+  const items = state.plan ? (state.plan.shopping_list || []) : [];
+  return items.filter((i) => i.purchased).length;
+}
+
+function updateClearPurchasedBtn() {
+  const n = purchasedCount();
+  const btn = $("#clear-purchased-btn");
+  btn.disabled = n === 0;
+  btn.textContent = `🧹 Clear purchased items (${n})`;
+}
+
+async function clearPurchased() {
+  if (!isOnline()) {
+    toast("⚠️ Clearing purchased items requires connection to your Home Server.");
+    return;
+  }
+  const msg = $("#shop-msg");
+  const n = purchasedCount();
+  if (n === 0) return;
+  if (!confirm(`Remove ${n} purchased item${n === 1 ? "" : "s"} from the list?`)) return;
+  try {
+    const data = await api("/api/shopping/clear-purchased", { method: "POST" });
+    state.plan = data.plan;
+    localStorage.setItem(CACHE_PLAN_STORAGE, JSON.stringify({
+      plan_id: state.planId,
+      created_at: state.planCreatedAt,
+      plan: state.plan,
+    }));
+    renderShopping();
+    setMsg(msg, `✅ Cleared ${data.cleared} purchased item${data.cleared === 1 ? "" : "s"} from the list.`, "ok");
+    toast("Purchased items cleared");
+  } catch (e) {
+    setMsg(msg, e.message, "err");
+  }
 }
 
 async function restock() {
+  if (!isOnline()) {
+    toast("⚠️ Restocking items requires connection to your Home Server.");
+    return;
+  }
   const msg = $("#shop-msg");
   try {
     const data = await api("/api/shopping/restock", {
@@ -414,6 +908,12 @@ async function restock() {
     });
     state.plan = data.plan;
     state.inventory = data.inventory;
+    localStorage.setItem(CACHE_PLAN_STORAGE, JSON.stringify({
+      plan_id: state.planId,
+      created_at: state.planCreatedAt,
+      plan: state.plan,
+    }));
+    localStorage.setItem(CACHE_INV_STORAGE, JSON.stringify(state.inventory));
     renderShopping();
     renderInventory();
     setMsg(msg, `✅ Added ${data.restocked.length} grocery items to your inventory!`, "ok");
@@ -461,6 +961,10 @@ function wirePhotoInput(fileInput, nameEl, previewEl, btn) {
 
 async function scanShelfPhoto() {
   if (!requireKey()) return;
+  if (!isOnline()) {
+    toast("⚠️ Photo scanning requires connection to your Home Server.");
+    return;
+  }
   const fileInput = $("#scan-file");
   const msg = $("#scan-msg");
   const btn = $("#scan-btn");
@@ -473,6 +977,7 @@ async function scanShelfPhoto() {
     fd.append("location", state.scanLocation);
     const data = await api("/api/scan-photo", { method: "POST", body: fd });
     state.inventory = data.inventory;
+    localStorage.setItem(CACHE_INV_STORAGE, JSON.stringify(data.inventory));
     renderInventory();
     setMsg(msg, `✅ Added ${data.added} items to ${state.scanLocation}!`, "ok");
     toast(`Added ${data.added} items!`);
@@ -487,10 +992,17 @@ async function scanShelfPhoto() {
 function handleReceiptResult(data, msg, doneLabel) {
   state.inventory = data.inventory;
   state.plan = data.plan;
+  localStorage.setItem(CACHE_INV_STORAGE, JSON.stringify(data.inventory));
+  if (data.plan) {
+    localStorage.setItem(CACHE_PLAN_STORAGE, JSON.stringify({
+      plan_id: state.planId,
+      created_at: state.planCreatedAt,
+      plan: data.plan,
+    }));
+  }
   renderInventory();
   renderShopping();
   setMsg(msg, `✅ Restocked ${data.logs.length} items from ${data.store_name}:`, "ok");
-  // Receipt logs use light markdown (**bold**, *italic*) — render it safely.
   $("#receipt-logs").innerHTML = data.logs.map((entry) => {
     let html = esc(entry)
       .replace(/\*\*(.+?)\*\*/g, "<b>$1</b>")
@@ -502,6 +1014,10 @@ function handleReceiptResult(data, msg, doneLabel) {
 
 async function scanReceipt() {
   if (!requireKey()) return;
+  if (!isOnline()) {
+    toast("⚠️ Receipt scanning requires connection to your Home Server.");
+    return;
+  }
   const fileInput = $("#receipt-file");
   const msg = $("#receipt-msg");
   const btn = $("#receipt-btn");
@@ -522,6 +1038,10 @@ async function scanReceipt() {
 
 async function scanReceiptPdf() {
   if (!requireKey()) return;
+  if (!isOnline()) {
+    toast("⚠️ PDF importing requires connection to your Home Server.");
+    return;
+  }
   const fileInput = $("#receipt-pdf-file");
   const msg = $("#receipt-msg");
   const btn = $("#receipt-pdf-btn");
@@ -542,6 +1062,10 @@ async function scanReceiptPdf() {
 
 async function pasteReceiptText() {
   if (!requireKey()) return;
+  if (!isOnline()) {
+    toast("⚠️ Pasting order text requires connection to your Home Server.");
+    return;
+  }
   const msg = $("#receipt-msg");
   const btn = $("#receipt-paste-btn");
   const text = $("#receipt-paste-text").value.trim();
@@ -573,31 +1097,62 @@ function wireTabs() {
   });
 }
 
-/* ---------------- Init ---------------- */
+/* ---------------- Init & Refresh ---------------- */
 
-async function refreshAll() {
-  const [inv, settings, latest] = await Promise.all([
-    api("/api/inventory"),
-    api("/api/settings"),
-    api("/api/plan/latest"),
-  ]);
-  state.inventory = inv;
-  state.settings = settings;
-  state.planId = latest.plan_id;
-  state.planCreatedAt = latest.created_at;
-  state.plan = latest.plan;
+async function refreshAll(silent = false) {
+  try {
+    if (!silent) setConnectionState("CONNECTING");
+    const [inv, settings, latest] = await Promise.all([
+      api("/api/inventory"),
+      api("/api/settings"),
+      api("/api/plan/latest"),
+    ]);
+    state.inventory = inv;
+    state.settings = settings;
+    state.planId = latest.plan_id;
+    state.planCreatedAt = latest.created_at;
+    state.plan = latest.plan;
+
+    saveToOfflineCache(inv, settings, latest);
+    setConnectionState("CONNECTED");
+    renderAll();
+    await flushOutbox();
+  } catch (err) {
+    // Failed to connect live: fallback to offline cache
+    loadFromOfflineCache();
+    renderAll();
+    if (!silent) {
+      toast("Working offline (cached data loaded) 📦");
+    }
+  }
+}
+
+function renderAll() {
   renderInventory();
   fillDietForm();
   renderMenu();
   renderShopping();
+  renderOutboxStatus();
 }
 
 function init() {
   buildDietForm();
   wireTabs();
 
-  /* Key onboarding: first-run setup screen when nothing is stored. */
-  if (!hasKey() && !sessionStorage.getItem("setup_skipped")) showSetup();
+  // Populate Server Settings inputs
+  const serverInput = $("#server-url-input");
+  const tokenInput = $("#server-token-input");
+  if (serverInput) serverInput.value = storedServerUrl();
+  if (tokenInput) tokenInput.value = storedAccessToken();
+
+  // Check if server setup screen should appear (e.g. running inside Capacitor with no URL saved)
+  if (isCapacitor() && !storedServerUrl() && !sessionStorage.getItem("server_setup_skipped")) {
+    showServerSetup();
+  } else if (!hasKey() && !sessionStorage.getItem("setup_skipped")) {
+    showSetup();
+  }
+
+  // Gemini Key setup screen events
   $("#settings-key-input").value = storedKey();
   $("#setup-save-btn").addEventListener("click", () => {
     saveKeyWithValidation($("#setup-key-input"), $("#setup-msg"), () => {
@@ -613,7 +1168,67 @@ function init() {
     saveKeyWithValidation($("#settings-key-input"), $("#settings-key-msg"));
   });
 
-  /* Scan tab */
+  // Server Setup Screen overlay events
+  $("#setup-server-test-btn").addEventListener("click", async () => {
+    const input = $("#setup-server-url");
+    const tokenInput = $("#setup-server-token");
+    const msg = $("#setup-server-msg");
+    let val = (input.value || "").trim().replace(/\/+$/, "");
+    const tok = (tokenInput.value || "").trim();
+    if (!val) {
+      setMsg(msg, "Enter your desktop server IP or URL first.", "err");
+      return;
+    }
+    if (!val.startsWith("http://") && !val.startsWith("https://")) {
+      val = "http://" + val;
+      input.value = val;
+    }
+    setMsg(msg, "Checking connection…");
+    const res = await probeHealth(val, tok);
+    if (res.ok) {
+      localStorage.setItem(SERVER_URL_STORAGE, val);
+      localStorage.setItem(ACCESS_TOKEN_STORAGE, tok);
+      setMsg(msg, "✅ Connected! Loading data…", "ok");
+      setTimeout(() => {
+        hideServerSetup();
+        if (serverInput) serverInput.value = val;
+        if (tokenInput) tokenInput.value = tok;
+        refreshAll();
+      }, 600);
+    } else {
+      setMsg(msg, `❌ Cannot connect: ${res.error}`, "err");
+    }
+  });
+
+  $("#setup-server-skip-btn").addEventListener("click", () => {
+    sessionStorage.setItem("server_setup_skipped", "1");
+    hideServerSetup();
+    refreshAll();
+  });
+
+  // Connection Banner action buttons
+  $("#banner-retry-btn").addEventListener("click", () => {
+    setConnectionState("CONNECTING");
+    refreshAll();
+  });
+  $("#banner-settings-btn").addEventListener("click", () => {
+    switchToTab("tab-diet");
+    const card = $("#server-settings-card");
+    if (card) card.scrollIntoView({ behavior: "smooth" });
+  });
+
+  // Server settings card buttons (Tab 2)
+  $("#server-save-btn").addEventListener("click", saveServerSettings);
+  $("#server-test-btn").addEventListener("click", testServerConnection);
+  $("#outbox-sync-btn").addEventListener("click", () => {
+    if (!isOnline()) {
+      toast("⚠️ Still disconnected from Home Server.");
+      return;
+    }
+    flushOutbox();
+  });
+
+  // Scan tab & Add Item modal
   document.querySelectorAll("#scan-location button").forEach((btn) => {
     btn.addEventListener("click", () => {
       document.querySelectorAll("#scan-location button").forEach((b) => b.classList.toggle("active", b === btn));
@@ -622,19 +1237,22 @@ function init() {
   });
   wirePhotoInput($("#scan-file"), $("#scan-file-name"), $("#scan-preview"), $("#scan-btn"));
   $("#scan-btn").addEventListener("click", scanShelfPhoto);
-  $("#inv-add-btn").addEventListener("click", () => {
-    $("#inventory-list").appendChild(inventoryRow({
-      item_name: "", quantity: 1, unit: "count",
-      location: state.scanLocation, category: "Pantry/Dry",
-    }));
-    $("#inventory-empty").style.display = "none";
-  });
+
+  $("#inv-add-btn").addEventListener("click", showAddItemModal);
+  $("#add-item-confirm-btn").addEventListener("click", submitAddItem);
+  $("#add-item-cancel-btn").addEventListener("click", hideAddItemModal);
+
   $("#inv-save-btn").addEventListener("click", saveInventory);
   $("#inv-clear-btn").addEventListener("click", async () => {
+    if (!isOnline()) {
+      toast("⚠️ Cannot clear inventory while disconnected.");
+      return;
+    }
     if (!confirm("Clear ALL inventory? This cannot be undone.")) return;
     try {
       await api("/api/inventory", { method: "DELETE" });
       state.inventory = [];
+      localStorage.setItem(CACHE_INV_STORAGE, JSON.stringify([]));
       renderInventory();
       toast("Inventory cleared.");
     } catch (e) { toast(e.message); }
@@ -648,6 +1266,7 @@ function init() {
 
   /* Shopping tab */
   $("#restock-btn").addEventListener("click", restock);
+  $("#clear-purchased-btn").addEventListener("click", clearPurchased);
   $("#export-btn").addEventListener("click", exportList);
   wirePhotoInput($("#receipt-file"), $("#receipt-file-name"), $("#receipt-preview"), $("#receipt-btn"));
   $("#receipt-btn").addEventListener("click", scanReceipt);
@@ -662,7 +1281,21 @@ function init() {
   $("#receipt-pdf-btn").addEventListener("click", scanReceiptPdf);
   $("#receipt-paste-btn").addEventListener("click", pasteReceiptText);
 
-  refreshAll().catch((e) => toast(`Could not load data: ${e.message}`));
+  // Network and lifecycle events
+  window.addEventListener("online", () => {
+    checkHeartbeat();
+  });
+  window.addEventListener("offline", () => {
+    setConnectionState("DISCONNECTED");
+  });
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") {
+      checkHeartbeat();
+    }
+  });
+
+  startHeartbeat();
+  refreshAll();
 
   if ("serviceWorker" in navigator) {
     navigator.serviceWorker.register("sw.js").catch(() => { /* offline support optional */ });

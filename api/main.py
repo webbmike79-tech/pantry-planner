@@ -30,6 +30,7 @@ from PIL import Image
 from pydantic import BaseModel, Field
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.datastructures import UploadFile as StarletteUploadFile
@@ -464,6 +465,35 @@ def restock_checked_shopping_items(plan_id: int, item_indices: List[int]) -> Lis
     return restocked_log
 
 
+def clear_purchased_shopping_items(plan_id: int) -> int:
+    """Remove all items already marked purchased from the plan's shopping list.
+
+    Returns the number of items removed. Inventory is not touched.
+    """
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT plan_json FROM saved_plans WHERE id = ?", (plan_id,))
+    row = c.fetchone()
+    if not row:
+        conn.close()
+        return 0
+
+    plan_data = json.loads(row[0])
+    shopping_list = plan_data.get("shopping_list", [])
+    remaining = [i for i in shopping_list if not i.get("purchased", False)]
+    removed = len(shopping_list) - len(remaining)
+
+    if removed:
+        plan_data["shopping_list"] = remaining
+        c.execute(
+            "UPDATE saved_plans SET plan_json = ? WHERE id = ?",
+            (json.dumps(plan_data), plan_id),
+        )
+        conn.commit()
+    conn.close()
+    return removed
+
+
 def process_scanned_receipt_items(
     plan_id: Optional[int], receipt_items: List[ReceiptLineItem]
 ) -> List[str]:
@@ -801,6 +831,21 @@ def build_shopping_markdown(plan: dict, created_at: Optional[str], include_purch
 
 app = FastAPI(title="Pantry-to-Menu Planner API", version="1.0.0")
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost",
+        "https://localhost",
+        "capacitor://localhost",
+        "http://localhost:8000",
+        "http://127.0.0.1:8000",
+    ],
+    allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1|192\.168\.\d+\.\d+|10\.\d+\.\d+\.\d+|172\.(1[6-9]|2\d|3[0-1])\.\d+\.\d+)(:\d+)?$",
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 init_db()
 
 
@@ -893,7 +938,7 @@ def latest_plan_payload():
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "app": "pantry-planner"}
 
 
 # ---------- Inventory ----------
@@ -1027,6 +1072,17 @@ def api_restock(body: RestockRequest):
     payload = latest_plan_payload()
     payload["restocked"] = restocked
     payload["inventory"] = get_inventory()
+    return payload
+
+
+@app.post("/api/shopping/clear-purchased")
+def api_clear_purchased():
+    plan_id, _created_at, plan = get_latest_plan()
+    if plan_id is None or plan is None:
+        raise HTTPException(status_code=404, detail="No plan generated yet.")
+    cleared = clear_purchased_shopping_items(plan_id)
+    payload = latest_plan_payload()
+    payload["cleared"] = cleared
     return payload
 
 

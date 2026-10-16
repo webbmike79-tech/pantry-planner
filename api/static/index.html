@@ -31,6 +31,63 @@
   </div>
 </div>
 
+<!-- ===== Home Server setup overlay (for first-run on wrapped app or when server URL needed) ===== -->
+<div id="server-setup-screen" class="setup-overlay" hidden>
+  <div class="setup-card">
+    <div class="setup-emoji">🏠</div>
+    <h2>Connect to Home Server</h2>
+    <p>Connect this phone to Pantry Planner running on your desktop PC so both devices share the exact same inventory and meal plans.</p>
+    <label class="field-label" for="setup-server-url">Desktop Server Address</label>
+    <input id="setup-server-url" type="text" placeholder="http://192.168.4.159:8000"
+           autocomplete="off" autocapitalize="off" spellcheck="false">
+    <p class="hint">Find this on your desktop app under <b>Connect Phone</b>.</p>
+    <label class="field-label" for="setup-server-token">Access Code (optional)</label>
+    <input id="setup-server-token" type="password" placeholder="Leave blank if not set"
+           autocomplete="off" autocapitalize="off" spellcheck="false">
+    <button id="setup-server-test-btn" class="btn btn-primary btn-big">Test &amp; Connect</button>
+    <p id="setup-server-msg" class="form-msg" role="status"></p>
+    <button id="setup-server-skip-btn" class="btn btn-ghost">Use Standalone / Local Only</button>
+  </div>
+</div>
+
+<!-- ===== Add Item Modal ===== -->
+<div id="add-item-modal" class="setup-overlay" hidden>
+  <div class="setup-card">
+    <div class="setup-emoji">➕</div>
+    <h2>Add Item to Kitchen</h2>
+    <label class="field-label" for="add-item-name">Item Name</label>
+    <input id="add-item-name" type="text" placeholder="e.g. Milk, Eggs, Black beans" autocomplete="off">
+    <div class="row-2col">
+      <div>
+        <label class="field-label" for="add-item-qty">Quantity</label>
+        <input id="add-item-qty" type="number" min="0.1" step="0.5" value="1">
+      </div>
+      <div>
+        <label class="field-label" for="add-item-unit">Unit</label>
+        <input id="add-item-unit" type="text" placeholder="count, oz, lbs, bottle" value="count">
+      </div>
+    </div>
+    <label class="field-label" for="add-item-loc">Storage Location</label>
+    <select id="add-item-loc">
+      <option value="Fridge">Fridge</option>
+      <option value="Freezer">Freezer</option>
+      <option value="Cupboard / Pantry" selected>Cupboard / Pantry</option>
+    </select>
+    <label class="field-label" for="add-item-cat">Category</label>
+    <select id="add-item-cat">
+      <option value="Produce/Veggies">Produce/Veggies</option>
+      <option value="Protein">Protein</option>
+      <option value="Dairy">Dairy</option>
+      <option value="Seasoning/Spice">Seasoning/Spice</option>
+      <option value="Drink/Beverage">Drink/Beverage</option>
+      <option value="Pantry/Dry" selected>Pantry/Dry</option>
+      <option value="Frozen">Frozen</option>
+    </select>
+    <button id="add-item-confirm-btn" class="btn btn-primary btn-big">Add to Inventory</button>
+    <button id="add-item-cancel-btn" class="btn btn-ghost">Cancel</button>
+  </div>
+</div>
+
 <header class="app-header">
   <h1>🥘 Pantry Planner</h1>
   <div class="banner">🎃 Spooky Harvest Kitchen Mode</div>
@@ -41,6 +98,17 @@
     <div class="stat"><span class="stat-num" id="stat-tobuy">0</span><span class="stat-label">🛒 To Buy</span></div>
   </div>
 </header>
+
+<div id="connection-banner" class="connection-banner" hidden>
+  <div class="banner-body">
+    <span class="banner-icon" id="banner-icon">⚠️</span>
+    <span class="banner-text" id="banner-text">Disconnected from Home Server. Showing cached data.</span>
+  </div>
+  <div class="banner-actions">
+    <button id="banner-retry-btn" class="banner-btn" type="button">Retry</button>
+    <button id="banner-settings-btn" class="banner-btn" type="button">Settings</button>
+  </div>
+</div>
 
 <main>
   <!-- ===== Tab 1: Scan & Stock ===== -->
@@ -96,6 +164,30 @@
       <p class="form-msg" id="diet-msg" role="status"></p>
     </div>
 
+    <h2>🏠 Home Desktop Server</h2>
+    <div class="card" id="server-settings-card">
+      <p class="hint">Connect to your home computer over Wi-Fi so your phone and desktop share the exact same inventory and meal plans.</p>
+      <div class="server-status-indicator" id="server-status-pill">
+        <span class="status-dot disconnected" id="server-status-dot"></span>
+        <span id="server-status-text">Not connected</span>
+      </div>
+      <label class="field-label" for="server-url-input">Desktop Server Address</label>
+      <input id="server-url-input" type="text" placeholder="http://192.168.4.159:8000 (blank for local)"
+             autocomplete="off" autocapitalize="off" spellcheck="false">
+      <label class="field-label" for="server-token-input">Access Code (optional)</label>
+      <input id="server-token-input" type="password" placeholder="Leave blank if access code is disabled"
+             autocomplete="off" autocapitalize="off" spellcheck="false">
+      <div class="btn-row">
+        <button id="server-save-btn" class="btn btn-primary">Connect &amp; Save</button>
+        <button id="server-test-btn" class="btn">Test Connection</button>
+      </div>
+      <p class="form-msg" id="server-msg" role="status"></p>
+      <div id="outbox-status-card" class="outbox-info" hidden>
+        <p>📦 <b>Offline Outbox:</b> <span id="outbox-count">0</span> item(s) waiting to sync.</p>
+        <button id="outbox-sync-btn" class="btn btn-accent">Sync Outbox Now</button>
+      </div>
+    </div>
+
     <h2>🔑 Gemini API Key</h2>
     <div class="card">
       <p class="hint">Your key is stored <b>only on this device</b> and is sent only to Google
@@ -127,6 +219,7 @@
       <div id="shopping-list"></div>
       <p class="empty-note" id="shopping-empty">Generate a weekly menu first to populate your shopping list.</p>
       <button id="restock-btn" class="btn btn-primary" disabled>📥 Add Checked Items to Inventory</button>
+      <button id="clear-purchased-btn" class="btn btn-danger" disabled>🧹 Clear purchased items</button>
       <p class="form-msg" id="shop-msg" role="status"></p>
       <hr class="sep">
       <label class="check-line">

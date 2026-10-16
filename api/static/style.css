@@ -241,3 +241,108 @@ input:focus, textarea:focus, select:focus { outline: 2px solid var(--accent); }
   max-width: 88vw; text-align: center; font-size: 0.95rem;
 }
 #toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+
+/* ---------- Connection Banner ---------- */
+.connection-banner {
+  background: #3b2314;
+  border-bottom: 2px solid var(--accent);
+  color: #fff;
+  padding: 10px 14px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: 0.88rem;
+  z-index: 40;
+}
+.connection-banner[hidden] { display: none; }
+.connection-banner.auth-err {
+  background: #421a1a;
+  border-bottom-color: var(--danger);
+}
+.connection-banner.connecting {
+  background: #2a2233;
+  border-bottom-color: var(--accent-soft);
+}
+.connection-banner .banner-body {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1;
+  line-height: 1.35;
+}
+.connection-banner .banner-actions {
+  display: flex;
+  gap: 6px;
+  flex-shrink: 0;
+}
+.banner-btn {
+  background: rgba(255, 255, 255, 0.15);
+  border: 1px solid rgba(255, 255, 255, 0.3);
+  color: #fff;
+  padding: 5px 10px;
+  border-radius: 6px;
+  font-size: 0.8rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+.banner-btn:active {
+  background: rgba(255, 255, 255, 0.25);
+}
+
+/* Status indicator pill */
+.server-status-indicator {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  border-radius: 20px;
+  font-size: 0.85rem;
+  font-weight: 600;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid var(--border);
+  margin-bottom: 10px;
+}
+.status-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  display: inline-block;
+  background: #888;
+}
+.status-dot.connected { background: #4caf50; box-shadow: 0 0 6px #4caf50; }
+.status-dot.connecting { background: #ffb347; animation: pulse 1.2s infinite; }
+.status-dot.disconnected { background: #f44336; }
+.status-dot.auth { background: #ff9800; }
+
+@keyframes pulse {
+  0% { opacity: 0.4; }
+  50% { opacity: 1; }
+  100% { opacity: 0.4; }
+}
+
+.row-2col {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+
+.badge-queued {
+  background: rgba(255, 179, 71, 0.25);
+  color: var(--accent-soft);
+  border: 1px solid var(--accent-soft);
+  font-size: 0.72rem;
+  padding: 2px 6px;
+  border-radius: 4px;
+  margin-left: 6px;
+  font-weight: bold;
+}
+
+.outbox-info {
+  margin-top: 14px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: rgba(255, 117, 24, 0.15);
+  border: 1px solid var(--border);
+  font-size: 0.88rem;
+}

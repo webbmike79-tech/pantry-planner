@@ -57,6 +57,7 @@ the backend, and is never logged. Alternatively, start the server with the
 | `GET /api/plan/latest` | Latest saved plan |
 | `POST /api/plan/cook` | `{day_index}` → deduct that day's ingredients |
 | `POST /api/shopping/restock` | `{indices}` → add checked items to inventory |
+| `POST /api/shopping/clear-purchased` | Remove all purchased items from the latest plan's shopping list |
 | `POST /api/receipt/scan` | Multipart receipt photo → auto-restock + check off list |
 | `GET /api/shopping-list/export?include_purchased=bool` | Shopping list as Markdown |
 | `POST /api/validate-key` | Validate the `X-Gemini-Key` header with one tiny Gemini call |
