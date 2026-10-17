@@ -2,6 +2,8 @@
 "use strict";
 
 const KEY_STORAGE = "gemini_api_key";
+const GROQ_KEY_STORAGE = "groq_api_key";
+const OPENROUTER_KEY_STORAGE = "openrouter_api_key";
 const HC_STORAGE = "daily_headcounts";
 const SERVER_URL_STORAGE = "pantry_server_url";
 const ACCESS_TOKEN_STORAGE = "pantry_access_token";
@@ -74,8 +76,14 @@ function setMsg(el, text, kind) {
 function storedKey() {
   return localStorage.getItem(KEY_STORAGE) || "";
 }
+function storedGroqKey() {
+  return localStorage.getItem(GROQ_KEY_STORAGE) || "";
+}
+function storedOpenRouterKey() {
+  return localStorage.getItem(OPENROUTER_KEY_STORAGE) || "";
+}
 function hasKey() {
-  return storedKey().length > 0;
+  return storedKey().length > 0 || storedGroqKey().length > 0 || storedOpenRouterKey().length > 0;
 }
 
 function storedServerUrl() {
@@ -349,24 +357,53 @@ function queueOfflineAdd(item) {
   toast("Added to offline queue (will sync when home) 📦");
 }
 
-/* ---------------- Gemini key handling ---------------- */
+/* ---------------- Provider key handling ---------------- */
 
-async function validateKey(candidate) {
-  const headers = { "X-Gemini-Key": candidate };
+async function validateProviderKey(provider, candidate) {
+  const headers = { "Content-Type": "application/json" };
   const token = storedAccessToken();
   if (token) headers["X-Pantry-Token"] = token;
-  const url = buildUrl("/api/validate-key");
-  const res = await fetch(url, {
-    method: "POST",
-    headers,
-  });
-  let data = {};
-  try { data = await res.json(); } catch (e) { /* non-JSON */ }
-  if (res.status === 400) {
-    return { ok: false, error: data.detail || "No key provided." };
+  const url = buildUrl("/api/validate-provider");
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ provider, api_key: candidate }),
+    });
+    let data = {};
+    try { data = await res.json(); } catch (e) { /* non-JSON */ }
+    if (res.status === 400) {
+      return { ok: false, error: data.detail || "No key provided." };
+    }
+    if (data.ok) return { ok: true, message: data.message };
+    return { ok: false, error: data.error || "That key didn't work. Please check it and try again." };
+  } catch (e) {
+    return { ok: false, error: "Couldn't reach the server to check the key. Is the app running?" };
   }
-  if (data.ok) return { ok: true };
-  return { ok: false, error: data.error || "That key didn't work. Please check it and try again." };
+}
+
+async function saveProviderKeyWithValidation(provider, storageKey, inputEl, msgEl, onSuccess) {
+  const candidate = inputEl.value.trim();
+  if (!candidate) {
+    localStorage.removeItem(storageKey);
+    setMsg(msgEl, `Cleared ${provider} key.`, "ok");
+    toast(`${provider} key removed`);
+    return;
+  }
+  setMsg(msgEl, `Checking your key with ${provider}…`);
+  const result = await validateProviderKey(provider, candidate);
+  if (result.ok) {
+    localStorage.setItem(storageKey, candidate);
+    setMsg(msgEl, `✅ ${provider} key connected!`, "ok");
+    toast(`${provider} key saved ✅`);
+    if (onSuccess) onSuccess();
+  } else {
+    setMsg(msgEl, result.error, "err");
+  }
+}
+
+async function validateKey(candidate) {
+  return validateProviderKey("gemini", candidate);
 }
 
 /* Validate first; only store the key in localStorage after Google accepts it. */
@@ -432,6 +469,10 @@ async function api(path, opts = {}) {
   const headers = Object.assign({}, opts.headers || {});
   const key = storedKey();
   if (key) headers["X-Gemini-Key"] = key;
+  const groqKey = storedGroqKey();
+  if (groqKey) headers["X-Groq-Key"] = groqKey;
+  const openrouterKey = storedOpenRouterKey();
+  if (openrouterKey) headers["X-OpenRouter-Key"] = openrouterKey;
   const token = storedAccessToken();
   if (token) headers["X-Pantry-Token"] = token;
 
@@ -983,7 +1024,8 @@ async function scanShelfPhoto() {
     state.inventory = data.inventory;
     localStorage.setItem(CACHE_INV_STORAGE, JSON.stringify(data.inventory));
     renderInventory();
-    setMsg(msg, `✅ Added ${data.added} items to ${state.scanLocation}!`, "ok");
+    const servedTag = data.served_by ? ` (served by ${esc(data.served_by)})` : "";
+    setMsg(msg, `✅ Added ${data.added} items to ${state.scanLocation}!${servedTag}`, "ok");
     toast(`Added ${data.added} items!`);
   } catch (e) {
     setMsg(msg, e.message, "err");
@@ -1006,7 +1048,8 @@ function handleReceiptResult(data, msg, doneLabel) {
   }
   renderInventory();
   renderShopping();
-  setMsg(msg, `✅ Restocked ${data.logs.length} items from ${data.store_name}:`, "ok");
+  const servedTag = data.served_by ? ` (served by ${esc(data.served_by)})` : "";
+  setMsg(msg, `✅ Restocked ${data.logs.length} items from ${data.store_name}${servedTag}:`, "ok");
   $("#receipt-logs").innerHTML = data.logs.map((entry) => {
     let html = esc(entry)
       .replace(/\*\*(.+?)\*\*/g, "<b>$1</b>")
@@ -1156,7 +1199,26 @@ function init() {
     showSetup();
   }
 
-  // Gemini Key setup screen events
+  // AI Provider Keys setup events
+  const groqInput = $("#groq-key-input");
+  if (groqInput) groqInput.value = storedGroqKey();
+  const openrouterInput = $("#openrouter-key-input");
+  if (openrouterInput) openrouterInput.value = storedOpenRouterKey();
+
+  const groqBtn = $("#groq-key-btn");
+  if (groqBtn) {
+    groqBtn.addEventListener("click", () => {
+      saveProviderKeyWithValidation("groq", GROQ_KEY_STORAGE, $("#groq-key-input"), $("#groq-key-msg"));
+    });
+  }
+
+  const openrouterBtn = $("#openrouter-key-btn");
+  if (openrouterBtn) {
+    openrouterBtn.addEventListener("click", () => {
+      saveProviderKeyWithValidation("openrouter", OPENROUTER_KEY_STORAGE, $("#openrouter-key-input"), $("#openrouter-key-msg"));
+    });
+  }
+
   $("#settings-key-input").value = storedKey();
   $("#setup-save-btn").addEventListener("click", () => {
     saveKeyWithValidation($("#setup-key-input"), $("#setup-msg"), () => {

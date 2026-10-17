@@ -11,6 +11,13 @@ import streamlit as st
 from google import genai
 from google.genai import types
 
+from api.ai_fallback import (
+    ProviderKeys,
+    extract_provider_keys,
+    generate_structured_with_fallback,
+    validate_provider_key,
+)
+
 # ==========================================
 # 1. SEASONAL & HOLIDAY THEME ENGINE
 # ==========================================
@@ -642,34 +649,19 @@ def get_client(api_key: str):
     return genai.Client(api_key=api_key)
 
 
-def _generate_structured(api_key: str, contents, schema, temperature: float, what: str):
-    """Shared Gemini structured-output call with friendly error wrapping."""
-    try:
-        client = get_client(api_key)
-        response = client.models.generate_content(
-            model="gemini-3.8-flash",
-            contents=contents,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_schema=schema,
-                temperature=temperature,
-            ),
-        )
-    except Exception as e:
-        raise RuntimeError(f"Gemini could not {what}. API error: {e}") from e
-    if not getattr(response, "text", None):
-        raise RuntimeError(
-            f"Gemini returned an empty response while trying to {what}. Please try again."
-        )
-    try:
-        return schema.model_validate_json(response.text)
-    except Exception as e:
-        raise RuntimeError(
-            f"Gemini returned data in an unexpected format while trying to {what}. Please try again. ({e})"
-        ) from e
+def _generate_structured(keys_or_key, contents, schema, temperature: float, what: str):
+    """Shared structured-output call routed through the AI provider fallback chain."""
+    if isinstance(keys_or_key, ProviderKeys):
+        keys = keys_or_key
+    elif isinstance(keys_or_key, str):
+        keys = ProviderKeys(gemini_key=keys_or_key)
+    else:
+        keys = ProviderKeys()
+    result, _served_by = generate_structured_with_fallback(keys, contents, schema, temperature, what)
+    return result
 
 
-def analyze_storage_photo(api_key: str, image: Image.Image, location: str) -> List[DetectedItem]:
+def analyze_storage_photo(keys_or_key, image: Image.Image, location: str) -> List[DetectedItem]:
     prompt = f"""
     You are scanning a user's {location}.
     Identify all visible food items, ingredients, veggies, drinks, and seasonings.
@@ -677,7 +669,7 @@ def analyze_storage_photo(api_key: str, image: Image.Image, location: str) -> Li
     (e.g., 0.5 gallon, 2 cans, 12 oz, 1 bottle).
     """
     parsed = _generate_structured(
-        api_key, [image, prompt], VisionInventoryResult, 0.2, f"scan your {location} photo"
+        keys_or_key, [image, prompt], VisionInventoryResult, 0.2, f"scan your {location} photo"
     )
     return parsed.items
 
