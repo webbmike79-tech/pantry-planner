@@ -216,7 +216,10 @@ function startHeartbeat() {
 function loadFromOfflineCache() {
   try {
     const cachedInv = localStorage.getItem(CACHE_INV_STORAGE);
-    if (cachedInv) state.inventory = JSON.parse(cachedInv);
+    if (cachedInv) {
+      const parsed = JSON.parse(cachedInv);
+      state.inventory = Array.isArray(parsed) ? parsed : [];
+    }
     const cachedSettings = localStorage.getItem(CACHE_SETTINGS_STORAGE);
     if (cachedSettings) state.settings = JSON.parse(cachedSettings);
     const cachedPlan = localStorage.getItem(CACHE_PLAN_STORAGE);
@@ -514,6 +517,7 @@ function inventoryRow(item) {
 function renderInventory() {
   const list = $("#inventory-list");
   list.innerHTML = "";
+  if (!Array.isArray(state.inventory)) state.inventory = [];
   state.inventory.forEach((item) => list.appendChild(inventoryRow(item)));
   $("#inventory-empty").style.display = state.inventory.length ? "none" : "block";
   renderStatus();
@@ -1107,7 +1111,7 @@ async function refreshAll(silent = false) {
       api("/api/settings"),
       api("/api/plan/latest"),
     ]);
-    state.inventory = inv;
+    state.inventory = Array.isArray(inv) ? inv : [];
     state.settings = settings;
     state.planId = latest.plan_id;
     state.planCreatedAt = latest.created_at;
