@@ -1,0 +1,14 @@
+{
+  "name": "pantry-planner",
+  "version": "1.0.0",
+  "description": "Pantry-to-Menu Planner",
+  "private": true,
+  "scripts": {
+    "cap": "cap"
+  },
+  "dependencies": {
+    "@capacitor/android": "^8.5.3",
+    "@capacitor/cli": "^8.5.3",
+    "@capacitor/core": "^8.5.3"
+  }
+}

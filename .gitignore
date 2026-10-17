@@ -2,3 +2,11 @@
 __pycache__/
 *.pyc
 pantry_planner.db
+node_modules/
+.gradle/
+android/.gradle/
+android/app/build/
+android/build/
+android/local.properties
+android/captures/
+*.apk

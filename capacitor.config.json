@@ -1,0 +1,9 @@
+{
+  "appId": "com.webbmike.pantryplanner",
+  "appName": "Pantry Planner",
+  "webDir": "api/static",
+  "server": {
+    "androidScheme": "https",
+    "cleartext": true
+  }
+}
