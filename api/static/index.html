@@ -190,10 +190,10 @@
 
     <h2>🔑 Gemini API Key</h2>
     <div class="card">
-      <p class="hint">Your key is stored <b>only on this device</b> and is sent only to Google
-        (through this app's backend) when you scan a photo or generate a menu. It is never logged.
+      <p class="hint">When connected to your Home Server, all AI requests use the server's configured keys automatically.
+        This field applies when running in standalone offline mode. Your key is stored <b>only on this device</b> and is never logged.
         Need a key? <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">Get one free here</a> — no credit card.</p>
-      <label class="field-label" for="settings-key-input">Gemini API Key</label>
+      <label class="field-label" for="settings-key-input">Gemini API Key (Standalone Mode)</label>
       <input id="settings-key-input" type="password" placeholder="Paste a Gemini API key"
              autocomplete="off" autocapitalize="off" spellcheck="false">
       <button id="settings-key-btn" class="btn btn-primary">Save &amp; Connect</button>
@@ -202,7 +202,7 @@
 
     <h2>⚡ Fallback AI Providers (Optional)</h2>
     <div class="card">
-      <p class="hint">If Gemini experiences high congestion (503s or 429s), the app automatically fails over to your configured backup providers.</p>
+      <p class="hint">In standalone mode, if Gemini experiences congestion, the app fails over to your configured backup providers. In connected mode, the server's own fallback chain is used automatically.</p>
       
       <label class="field-label" for="groq-key-input">Groq API Key (optional)</label>
       <input id="groq-key-input" type="password" placeholder="gsk_... (meta-llama/llama-4-scout-17b-16e-instruct)"

@@ -158,6 +158,7 @@ function setConnectionState(newState, detail) {
   updateConnectionUI();
 
   if (oldState !== "CONNECTED" && newState === "CONNECTED") {
+    hideSetup();
     toast("Connected to Home Server ✅");
     flushOutbox();
   }
@@ -451,9 +452,12 @@ function hideAddItemModal() {
 }
 
 function requireKey() {
+  // Key ownership rule: when connected to a server, all AI calls are served by the
+  // server's configured keys. A connected client never prompts for, requires, or blocks on keys.
+  if (isOnline()) return true;
   if (hasKey()) return true;
   showSetup();
-  toast("Add your free Gemini key first 🔑");
+  toast("Add your free Gemini key first 🔑 (or connect to your desktop server in Settings)");
   return false;
 }
 
@@ -1192,10 +1196,13 @@ function init() {
   if (serverInput) serverInput.value = storedServerUrl();
   if (tokenInput) tokenInput.value = storedAccessToken();
 
-  // Check if server setup screen should appear (e.g. running inside Capacitor with no URL saved)
+  // Check if onboarding overlays should appear:
+  // 1. If running inside Capacitor without a configured server URL, show server setup screen.
+  // 2. In connected mode (server URL configured), NEVER prompt for, require, or block on keys.
+  // 3. Only in standalone mode with no server URL and no stored keys, show first-run key setup.
   if (isCapacitor() && !storedServerUrl() && !sessionStorage.getItem("server_setup_skipped")) {
     showServerSetup();
-  } else if (!hasKey() && !sessionStorage.getItem("setup_skipped")) {
+  } else if (!storedServerUrl() && !hasKey() && !sessionStorage.getItem("setup_skipped")) {
     showSetup();
   }
 

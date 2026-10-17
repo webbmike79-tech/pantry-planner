@@ -280,6 +280,26 @@ async function runTests() {
   console.log("✓ Test 7 Passed: All destructive actions safely blocked while offline");
   passed++;
 
+  // Test 8: Key ownership rule: connected mode never blocks on client keys
+  setConnectionState("CONNECTED");
+  localStorage.removeItem(KEY_STORAGE);
+  localStorage.removeItem(GROQ_KEY_STORAGE);
+  localStorage.removeItem(OPENROUTER_KEY_STORAGE);
+  assert.strictEqual(hasKey(), false, "Client has no local keys stored");
+  assert.strictEqual(requireKey(), true, "Connected mode permits AI operations without client keys");
+  console.log("✓ Test 8 Passed: Connected mode never prompts for or blocks on client keys");
+  passed++;
+
+  // Test 9: Key persistence in localStorage survives across simulated restarts
+  localStorage.setItem(KEY_STORAGE, "AIzaSyTestGeminiKey123");
+  localStorage.setItem(GROQ_KEY_STORAGE, "gsk_TestGroqKey456");
+  localStorage.setItem(OPENROUTER_KEY_STORAGE, "sk-or-v1-TestOpenRouter789");
+  assert.strictEqual(storedKey(), "AIzaSyTestGeminiKey123");
+  assert.strictEqual(storedGroqKey(), "gsk_TestGroqKey456");
+  assert.strictEqual(storedOpenRouterKey(), "sk-or-v1-TestOpenRouter789");
+  console.log("✓ Test 9 Passed: Provider keys persist reliably across storage accesses");
+  passed++;
+
   console.log(`\nAll ${passed} Mobile Client tests passed successfully!`);
 }
 

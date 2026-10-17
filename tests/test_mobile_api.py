@@ -169,5 +169,35 @@ class TestMobileApi(unittest.TestCase):
         self.assertEqual(remaining[0]["item_name"], "Eggs")
 
 
+    def test_scan_request_succeeds_using_server_keys_when_client_sends_no_key(self):
+        """Connected client with no key headers succeeds when server has env provider keys configured."""
+        from unittest.mock import patch
+        import io
+        from PIL import Image
+
+        # Ensure server has an env key configured
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "server-env-key-12345"}):
+            with patch("api.ai_fallback._call_gemini") as mock_gemini:
+                mock_gemini.return_value = '{"items": [{"item_name": "Milk", "category": "Dairy", "quantity": 1.0, "unit": "gallon"}]}'
+
+                # Create dummy image bytes
+                img = Image.new("RGB", (32, 32), color="blue")
+                buf = io.BytesIO()
+                img.save(buf, format="JPEG")
+                buf.seek(0)
+
+                # Client sends NO x-gemini-key, x-groq-key, or x-openrouter-key headers
+                res = self.client.post(
+                    "/api/scan-photo",
+                    data={"location": "Fridge"},
+                    files={"file": ("shelf.jpg", buf, "image/jpeg")},
+                )
+                self.assertEqual(res.status_code, 200)
+                data = res.json()
+                self.assertEqual(data["added"], 1)
+                self.assertEqual(data["served_by"], "gemini")
+                self.assertEqual(data["items"][0]["item_name"], "Milk")
+
+
 if __name__ == "__main__":
     unittest.main()
