@@ -1428,6 +1428,19 @@ def api_validate_provider(body: ValidateProviderRequest, request: Request):
     ok, msg = validate_provider_key(provider, key)
     if not ok:
         return {"ok": False, "error": msg}
+    try:
+        cfg_file = os.environ.get("PANTRY_CONFIG_FILE", "pantry_desktop_config.json")
+        data = {}
+        if os.path.exists(cfg_file):
+            with open(cfg_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        if "provider_keys" not in data or not isinstance(data["provider_keys"], dict):
+            data["provider_keys"] = {}
+        data["provider_keys"][provider] = key
+        with open(cfg_file, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except Exception:
+        pass
     return {"ok": True, "message": msg}
 
 
@@ -1442,6 +1455,19 @@ def api_validate_key(request: Request):
     ok, msg = validate_provider_key("gemini", api_key)
     if not ok:
         return {"ok": False, "error": f"That key didn't work — {msg}"}
+    try:
+        cfg_file = os.environ.get("PANTRY_CONFIG_FILE", "pantry_desktop_config.json")
+        data = {}
+        if os.path.exists(cfg_file):
+            with open(cfg_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        if "provider_keys" not in data or not isinstance(data["provider_keys"], dict):
+            data["provider_keys"] = {}
+        data["provider_keys"]["gemini"] = api_key
+        with open(cfg_file, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except Exception:
+        pass
     return {"ok": True, "message": "Key works! You're connected."}
 
 
