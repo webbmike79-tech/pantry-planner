@@ -164,8 +164,10 @@ global.document = {
 global.window = {
   addEventListener() {},
   scrollTo() {},
+  open() {},
   location: { protocol: "http:", origin: "http://localhost:8000" }
 };
+
 
 // Mock fetch
 let fetchHandler = null;
@@ -562,6 +564,111 @@ async function runTests() {
   console.log("✓ Test 14 Passed: Clear menu button, confirmation copy, plan deletion, and inventory/settings isolation");
   passed++;
 
+  // Test 15: Milestone 6 - "Shop this list" grocery handoff, Phase 1
+  // 1. URL construction unit tests covering both providers with tricky item names
+  const icUrl1 = buildGrocerySearchUrl("instacart", "Whole Milk");
+  assert.strictEqual(icUrl1, "https://www.instacart.com/store/s?k=Whole%20Milk", "Instacart normal query");
+
+  const icUrl2 = buildGrocerySearchUrl("instacart", "Salt & Pepper", "78701");
+  assert.strictEqual(icUrl2, "https://www.instacart.com/store/s?k=Salt%20%26%20Pepper&postal_code=78701", "Instacart ampersand and zip");
+
+  const icUrl3 = buildGrocerySearchUrl("instacart", "1/2 lb Chicken Breasts (boneless)");
+  assert.strictEqual(icUrl3, "https://www.instacart.com/store/s?k=1%2F2%20lb%20Chicken%20Breasts%20(boneless)", "Instacart punctuation and slashes");
+
+  const wmUrl1 = buildGrocerySearchUrl("walmart", "Fresh Garlic Cloves");
+  assert.strictEqual(wmUrl1, "https://www.walmart.com/search?q=Fresh%20Garlic%20Cloves", "Walmart spaces query");
+
+  const wmUrl2 = buildGrocerySearchUrl("walmart", "Mac & Cheese", "90210");
+  assert.strictEqual(wmUrl2, "https://www.walmart.com/search?q=Mac%20%26%20Cheese&postal_code=90210", "Walmart ampersand and zip");
+
+  const wmUrl3 = buildGrocerySearchUrl("walmart", "2% Reduced Fat Milk (1 gal)");
+  assert.strictEqual(wmUrl3, "https://www.walmart.com/search?q=2%25%20Reduced%20Fat%20Milk%20(1%20gal)", "Walmart percent and parentheses");
+
+  assert.strictEqual(buildGrocerySearchUrl("walmart", "   "), "", "Empty item name returns empty string");
+  assert.throws(() => buildGrocerySearchUrl("unsupported_store", "Eggs"), /Unsupported grocery provider/);
+
+  // 2. Settings persist / clear tests
+  localStorage.removeItem(GROCERY_STORE_STORAGE);
+  localStorage.removeItem(GROCERY_ZIP_STORAGE);
+  assert.strictEqual(getStoredGroceryStore(), "", "Default store is unset initially");
+  assert.strictEqual(getStoredGroceryZip(), "", "Default zip is unset initially");
+
+  setStoredGroceryStore("instacart");
+  setStoredGroceryZip("78701");
+  assert.strictEqual(getStoredGroceryStore(), "instacart", "Persisted instacart store");
+  assert.strictEqual(getStoredGroceryZip(), "78701", "Persisted zip");
+
+  setStoredGroceryStore("walmart");
+  assert.strictEqual(getStoredGroceryStore(), "walmart", "Round-trip update to walmart persists");
+
+  clearGrocerySettings();
+  assert.strictEqual(getStoredGroceryStore(), "", "Clearing settings resets store");
+  assert.strictEqual(getStoredGroceryZip(), "", "Clearing settings resets zip");
+
+  // 3. One-off ZIP override does NOT overwrite the saved home store ZIP
+  setStoredGroceryStore("walmart");
+  setStoredGroceryZip("10001");
+
+  showShopModal();
+  const shopModalEl = document.querySelector("#shop-modal");
+  assert.strictEqual(shopModalEl.hidden, false, "Shop modal opens");
+
+  const zipInputEl = document.querySelector("#shop-override-zip");
+  assert.strictEqual(zipInputEl.value, "10001", "Modal defaults to saved home ZIP");
+
+  zipInputEl.value = "90210";
+
+  let openedUrls = [];
+  const origWindowOpen = global.window.open;
+  global.window.open = (url) => { openedUrls.push(url); return true; };
+
+  state.plan = {
+    shopping_list: [
+      { item_name: "Fresh Spinach", amount_needed: "1 bag", purchased: false },
+      { item_name: "Olive oil & vinegar", amount_needed: "1 bottle", purchased: false }
+    ]
+  };
+
+  executeShopHandoff();
+
+  assert.strictEqual(getStoredGroceryZip(), "10001", "One-off ZIP did NOT mutate saved home store ZIP");
+  assert.strictEqual(localStorage.getItem(GROCERY_ZIP_STORAGE), "10001", "Storage untouched by one-off override");
+
+  // 4. Empty shopping list disables or hides the button
+  state.plan = null;
+  renderShopping();
+  const shopBtn = document.querySelector("#shop-list-btn");
+  assert.strictEqual(shopBtn.disabled, true, "Shop button disabled when no plan exists");
+  assert.strictEqual(shopBtn.style.display, "none", "Shop button hidden when no plan exists");
+
+  state.plan = { shopping_list: [] };
+  renderShopping();
+  assert.strictEqual(shopBtn.disabled, true, "Shop button disabled when shopping list is empty");
+  assert.strictEqual(shopBtn.style.display, "none", "Shop button hidden when shopping list is empty");
+
+  state.plan = { shopping_list: [{ item_name: "Bread", amount_needed: "1 loaf", purchased: true }] };
+  renderShopping();
+  assert.strictEqual(shopBtn.disabled, true, "Shop button disabled when all items are purchased");
+  assert.strictEqual(shopBtn.style.display, "inline-block", "Shop button shown when items present");
+
+  state.plan = { shopping_list: [{ item_name: "Bread", amount_needed: "1 loaf", purchased: false }] };
+  renderShopping();
+  assert.strictEqual(shopBtn.disabled, false, "Shop button enabled when unpurchased items exist");
+  assert.strictEqual(shopBtn.style.display, "inline-block", "Shop button shown when items present");
+
+  // 5. Transparency / honesty copy verification
+  const rawHtml = fs.readFileSync(path.resolve(__dirname, "../api/static/index.html"), "utf-8");
+  assert.ok(
+    rawHtml.includes("Pantry Planner prepares your shopping search links and hands them over to your chosen grocery service. All ordering, fulfillment, and payment happen directly on the store's website or app."),
+    "Exact transparency and honesty copy present in shop modal HTML"
+  );
+  assert.ok(!rawHtml.includes("affiliate"), "No affiliate references");
+
+  global.window.open = origWindowOpen;
+
+  console.log("✓ Test 15 Passed: Milestone 6 - Shop this list grocery handoff, URL construction, ZIP isolation, and settings persistence");
+  passed++;
+
   console.log(`\nAll ${passed} Mobile Client tests passed successfully!`);
 }
 
@@ -569,5 +676,6 @@ runTests().catch((err) => {
   console.error("Test failed:", err);
   process.exit(1);
 });
+
 
 
