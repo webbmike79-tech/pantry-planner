@@ -669,8 +669,80 @@ async function runTests() {
   console.log("✓ Test 15 Passed: Milestone 6 - Shop this list grocery handoff, URL construction, ZIP isolation, and settings persistence");
   passed++;
 
+  // Test 16: Meal images on recipe cards (Milestone 6 Task 3)
+  // 1. Mapped category images
+  const testCategories = [
+    { name: "Fluffy Buttermilk Pancakes", cat: "breakfast" },
+    { name: "Crispy Beef Tacos", cat: "tacos" },
+    { name: "Spaghetti Bolognese", cat: "pasta" },
+    { name: "Chicken and Veggie Stir-Fry", cat: "stir-fry" },
+    { name: "Pan-Seared Salmon Fillet", cat: "seafood" },
+    { name: "Herb Roasted Chicken Thighs", cat: "roast-chicken" },
+    { name: "Creamy Tomato Soup", cat: "soup" },
+    { name: "Fresh Garden Salad with Greens", cat: "salad" },
+    { name: "Bacon Avocado Burger", cat: "sandwich" }
+  ];
+
+  testCategories.forEach(({ name, cat }) => {
+    const meal = { dish_name: name, prep_steps: ["Prepare and cook"] };
+    assert.strictEqual(getMealImageCategory(meal), cat, `Category matches for ${name}`);
+    assert.strictEqual(getMealImageUrl(meal), `meal-images/${cat}.svg`, `Image URL matches for ${name}`);
+    const block = mealBlock("🍽️", "Dinner", "dinner", meal, 0, false);
+    assert.ok(block.includes(`src="meal-images/${cat}.svg"`), `Meal card renders category image for ${name}`);
+    assert.ok(block.includes(`data-category="${cat}"`), `Category attribute present for ${name}`);
+    assert.ok(block.includes('class="meal-banner"'), "Meal banner container present");
+  });
+
+  // 2. Unmapped meal renders default
+  const unmappedMeal = { dish_name: "Grandma's Mysterious Surprise", prep_steps: ["Heat and enjoy"] };
+  assert.strictEqual(getMealImageCategory(unmappedMeal), "default", "Unmapped meal resolves to default category");
+  assert.strictEqual(getMealImageUrl(unmappedMeal), "meal-images/default.svg", "Unmapped meal resolves to default.svg");
+  const unmappedBlock = mealBlock("🌙", "Dinner", "dinner", unmappedMeal, 0, false);
+  assert.ok(unmappedBlock.includes('src="meal-images/default.svg"'), "Unmapped meal renders default image");
+  assert.ok(unmappedBlock.includes('data-category="default"'), "Unmapped category is default");
+
+  // 3. Image load failure fallback to branded placeholder tile with initial
+  assert.ok(unmappedBlock.includes('class="meal-image-placeholder"'), "Placeholder element exists");
+  assert.ok(unmappedBlock.includes('<span class="placeholder-initial">G</span>'), "Placeholder has correct dish initial");
+  assert.ok(unmappedBlock.includes('onerror="this.style.display=\'none\'; if (this.nextElementSibling) this.nextElementSibling.style.display=\'flex\';"'), "Image onerror switches to placeholder");
+
+  // 4. Swapped meal updates image dynamically
+  const initialDish = { dish_name: "Oatmeal with Apples", prep_steps: ["Boil oats"] };
+  const initialRender = mealBlock("🌅", "Breakfast", "breakfast", initialDish, 0, false);
+  assert.ok(initialRender.includes('src="meal-images/breakfast.svg"'), "Initial meal has breakfast image");
+
+  const swappedDish = { dish_name: "Chicken Enchiladas", changed_from: "Oatmeal with Apples", prep_steps: ["Bake"] };
+  const swappedRender = mealBlock("🌅", "Breakfast", "breakfast", swappedDish, 0, false);
+  assert.ok(swappedRender.includes('src="meal-images/tacos.svg"'), "Swapped meal updates image to tacos");
+  assert.ok(swappedRender.includes('Changed from: <i>Oatmeal with Apples</i>'), "Changed-from note preserved on swapped meal");
+
+  // 5. Verify local bundled image set exists on disk and total size is under 500KB
+  const imgDir = path.resolve(__dirname, "../api/static/meal-images");
+  const expectedFiles = [
+    "tacos.svg", "pasta.svg", "stir-fry.svg", "roast-chicken.svg",
+    "salad.svg", "soup.svg", "breakfast.svg", "seafood.svg",
+    "sandwich.svg", "default.svg"
+  ];
+  let totalBytes = 0;
+  for (const f of expectedFiles) {
+    const fPath = path.join(imgDir, f);
+    assert.ok(fs.existsSync(fPath), `Image file ${f} exists`);
+    totalBytes += fs.statSync(fPath).size;
+  }
+  assert.ok(totalBytes > 0 && totalBytes < 500 * 1024, `Total size ${totalBytes} bytes is well within budget (<500KB)`);
+
+  // 6. Verify credits note in HTML
+  assert.ok(
+    rawHtml.includes("Meal Imagery Credits:</b> Built-in vector culinary illustrations designed specifically for Pantry Planner under Creative Commons CC0 / Open License."),
+    "Attribution / credits note present in HTML"
+  );
+
+  console.log("✓ Test 16 Passed: Meal images on recipe cards, category mapping, default fallback, placeholder initial, and image swapping");
+  passed++;
+
   console.log(`\nAll ${passed} Mobile Client tests passed successfully!`);
 }
+
 
 runTests().catch((err) => {
   console.error("Test failed:", err);
