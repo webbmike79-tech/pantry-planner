@@ -22,7 +22,14 @@ class TestMobileApi(unittest.TestCase):
         cls.client = TestClient(app)
 
     def setUp(self):
+        import sqlite3
+        from api.main import DB_FILE
         init_db()
+        conn = sqlite3.connect(DB_FILE)
+        conn.execute("DELETE FROM inventory")
+        conn.execute("DELETE FROM saved_plans")
+        conn.commit()
+        conn.close()
 
     @classmethod
     def tearDownClass(cls):
@@ -198,6 +205,102 @@ class TestMobileApi(unittest.TestCase):
                 self.assertEqual(data["served_by"], "gemini")
                 self.assertEqual(data["items"][0]["item_name"], "Milk")
 
+    def test_fresh_db_boot_all_lists_empty(self):
+        """Fresh database boot: inventory empty, saved_plans empty, latest plan payload returns None."""
+        from api.main import get_inventory, get_latest_plan, latest_plan_payload
+        # Verify direct DB functions
+        self.assertEqual(get_inventory(), [])
+        plan_id, created_at, plan = get_latest_plan()
+        self.assertIsNone(plan_id)
+        self.assertIsNone(created_at)
+        self.assertIsNone(plan)
+
+        # Verify API endpoints
+        inv_res = self.client.get("/api/inventory")
+        self.assertEqual(inv_res.status_code, 200)
+        self.assertEqual(inv_res.json(), [])
+
+        plan_res = self.client.get("/api/plan/latest")
+        self.assertEqual(plan_res.status_code, 200)
+        self.assertEqual(plan_res.json(), {"plan_id": None, "created_at": None, "plan": None})
+
+    def test_existing_db_boot_inventory_and_settings_preserved(self):
+        """Upgrade safety: existing inventory and settings survive untouched across init_db."""
+        import sqlite3
+        from api.main import DB_FILE, init_db, get_inventory, get_settings, add_inventory_items, DetectedItem
+
+        # Add existing user inventory and customize settings
+        add_inventory_items("Fridge", [
+            DetectedItem(item_name="Ground Beef", category="Protein", quantity=2.0, unit="lbs")
+        ])
+        conn = sqlite3.connect(DB_FILE)
+        conn.execute("UPDATE settings SET base_headcount = 4 WHERE id = 1")
+        conn.commit()
+        conn.close()
+
+        # Re-run init_db (simulating app boot/upgrade on existing database)
+        init_db()
+
+        inv = get_inventory()
+        self.assertEqual(len(inv), 1)
+        self.assertEqual(inv[0]["item_name"], "Ground Beef")
+        self.assertEqual(inv[0]["quantity"], 2.0)
+
+        settings = get_settings()
+        self.assertEqual(settings["base_headcount"], 4)
+
+    def test_plan_menu_shopping_list_contains_only_plan_minus_inventory(self):
+        """When menu plan is saved, shopping list derives strictly from the saved plan and contains only needed items."""
+        from api.main import save_plan, get_latest_plan, latest_plan_payload
+
+        # Save a plan where 2 items are needed (e.g. Avocado and Sourdough Bread)
+        test_plan = {
+            "menu": [
+                {
+                    "day": "Monday",
+                    "headcount": 2,
+                    "breakfast": {"dish_name": "Avocado Toast", "cook_time_minutes": 10, "prep_steps": ["Toast bread", "Mash avocado"]},
+                    "lunch": None,
+                    "dinner": None,
+                    "ingredients_to_deduct": [],
+                    "cooked": False,
+                }
+            ],
+            "shopping_list": [
+                {
+                    "item_name": "Avocados",
+                    "category": "Veggies & Produce",
+                    "amount_needed": "2 count",
+                    "numeric_quantity": 2.0,
+                    "unit": "count",
+                    "default_location": "Fridge",
+                    "inventory_category": "Produce/Veggies",
+                    "reason": "For Monday breakfast",
+                    "purchased": False,
+                },
+                {
+                    "item_name": "Sourdough Bread",
+                    "category": "Pantry/Dry",
+                    "amount_needed": "1 loaf",
+                    "numeric_quantity": 1.0,
+                    "unit": "loaf",
+                    "default_location": "Cupboard / Pantry",
+                    "inventory_category": "Pantry/Dry",
+                    "reason": "For Monday breakfast",
+                    "purchased": False,
+                },
+            ],
+            "nutrition_notes": "Whole food balanced breakfast",
+        }
+        save_plan(test_plan)
+
+        payload = latest_plan_payload()
+        self.assertIsNotNone(payload["plan_id"])
+        self.assertIsNotNone(payload["plan"])
+        shop_items = [i["item_name"] for i in payload["plan"]["shopping_list"]]
+        self.assertEqual(shop_items, ["Avocados", "Sourdough Bread"])
+
 
 if __name__ == "__main__":
     unittest.main()
+

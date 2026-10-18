@@ -300,6 +300,20 @@ async function runTests() {
   console.log("✓ Test 9 Passed: Provider keys persist reliably across storage accesses");
   passed++;
 
+  // Test 10: Clean first-run state: empty shopping list displays plain empty message
+  state.plan = null;
+  state.inventory = [];
+  renderShopping();
+  const emptyEl = document.querySelector("#shopping-empty");
+  assert.strictEqual(emptyEl.style.display, "block");
+  assert.strictEqual(
+    emptyEl.textContent,
+    "No menu planned yet — your shopping list will build from your plan."
+  );
+  assert.strictEqual(document.querySelectorAll("#shopping-list .shop-item").length, 0);
+  console.log("✓ Test 10 Passed: Clean first-run shopping list is empty with exact required guidance message");
+  passed++;
+
   console.log(`\nAll ${passed} Mobile Client tests passed successfully!`);
 }
 
