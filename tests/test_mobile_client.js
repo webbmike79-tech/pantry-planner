@@ -52,12 +52,26 @@ function getOrCreateElement(id) {
         contains(c) { return this.classes.has(c); }
       },
       hidden: false,
+      readOnly: false,
       style: {},
       disabled: false,
       dataset: {},
       children: [],
       addEventListener() {},
       appendChild(child) { this.children.push(child); },
+      removeChild(child) {
+        const idx = this.children.indexOf(child);
+        if (idx !== -1) this.children.splice(idx, 1);
+      },
+      contains(child) { return this.children.includes(child); },
+      insertBefore(newNode, refNode) {
+        const idx = this.children.indexOf(refNode);
+        if (idx !== -1) {
+          this.children.splice(idx, 0, newNode);
+        } else {
+          this.children.push(newNode);
+        }
+      },
       scrollIntoView() {},
       focus() {},
       querySelector(s) {
@@ -96,6 +110,9 @@ function getOrCreateElement(id) {
 }
 
 global.document = {
+  getElementById(id) {
+    return getOrCreateElement(id);
+  },
   querySelector(sel) {
     if (sel.startsWith("#")) {
       return getOrCreateElement(sel.slice(1));
@@ -165,7 +182,25 @@ global.window = {
   addEventListener() {},
   scrollTo() {},
   open() {},
-  location: { protocol: "http:", origin: "http://localhost:8000" }
+  location: { protocol: "http:", origin: "http://localhost:8000", pathname: "/", search: "", hash: "" },
+  history: {
+    replaceState(st, title, url) {
+      if (typeof url === "string") {
+        try {
+          const u = new URL(url, "http://localhost:8000");
+          global.window.location.search = u.search;
+          global.window.location.pathname = u.pathname;
+          global.window.location.hash = u.hash;
+        } catch (e) {
+          const qIdx = url.indexOf("?");
+          global.window.location.search = qIdx !== -1 ? url.substring(qIdx) : "";
+        }
+      }
+    }
+  },
+  confirm(msg) {
+    return true;
+  }
 };
 
 
@@ -747,6 +782,220 @@ async function runTests() {
   );
 
   console.log("✓ Test 16 Passed: Meal images on recipe cards, category mapping, default fallback, placeholder initial, and image swapping");
+  passed++;
+
+  // Test 17: Milestone 7 Part 2 — Mom-proof onboarding & magic invite links
+  // 1. Single config point HOSTED_DEFAULT_SERVER_URL is empty in A2
+  assert.strictEqual(isHostedDefaultConfigured(), false, "HOSTED_DEFAULT_SERVER_URL is empty in A2");
+  assert.strictEqual(storedServerUrl(), "", "storedServerUrl() defaults to empty when unconfigured");
+
+  // 2. When configured (simulated Phase B): connect experience collapses to household code, URL in Advanced
+  setHostedDefaultServerUrl("https://pantry-space.hf.space");
+  assert.strictEqual(isHostedDefaultConfigured(), true, "HOSTED_DEFAULT_SERVER_URL is configured");
+  assert.strictEqual(storedServerUrl(), "https://pantry-space.hf.space", "storedServerUrl() falls back to hosted default");
+
+  updateServerSetupScreenLayout();
+  const titleEl = document.querySelector("#setup-server-title");
+  const descEl = document.querySelector("#setup-server-desc");
+  const advEl = document.querySelector("#setup-server-advanced");
+  const urlGroupEl = document.querySelector("#setup-server-url-group");
+  assert.strictEqual(titleEl.textContent, "Join Your Kitchen", "Title collapses to 'Join Your Kitchen'");
+  assert.strictEqual(descEl.textContent, "Enter your household code to connect to your shared pantry.", "Desc reflects household code connect");
+  assert.strictEqual(advEl.hidden, false, "Advanced toggle is exposed");
+  assert.ok(advEl.contains(urlGroupEl), "Server URL field tucked into Advanced section");
+
+  // Unconfigured (LAN/dev/A2) restores standard layout
+  setHostedDefaultServerUrl("");
+  updateServerSetupScreenLayout();
+  assert.strictEqual(titleEl.textContent, "Connect to Server", "Title restored to 'Connect to Server'");
+  assert.strictEqual(advEl.hidden, true, "Advanced toggle is hidden in LAN/dev mode");
+
+  // 3. Magic invite link: consumed once, stored, URL cleaned via history replace
+  localStorage.clear();
+  global.window.location.search = "?household=Maple+River+42";
+  global.window.location.pathname = "/";
+  handleMagicInviteLink();
+  assert.strictEqual(localStorage.getItem(ACCESS_TOKEN_STORAGE), "Maple River 42", "Household code stored from magic link");
+  assert.strictEqual(global.window.location.search, "", "URL query parameter deleted and cleaned");
+
+  // Re-running handleMagicInviteLink with cleaned URL is safe / no-op
+  handleMagicInviteLink();
+  assert.strictEqual(localStorage.getItem(ACCESS_TOKEN_STORAGE), "Maple River 42", "Code remains intact on subsequent runs");
+
+  // Absent parameter leaves existing storage and URL untouched
+  localStorage.setItem(ACCESS_TOKEN_STORAGE, "River Bend 7");
+  global.window.location.search = "";
+  handleMagicInviteLink();
+  assert.strictEqual(localStorage.getItem(ACCESS_TOKEN_STORAGE), "River Bend 7", "Absent parameter leaves stored code untouched");
+  assert.strictEqual(global.window.location.search, "", "URL remains untouched");
+
+  // Magic link carrying DIFFERENT code triggers wrong-kitchen guard
+  const switchModal = document.querySelector("#switch-kitchen-modal");
+  global.window.location.search = "?household=Maple+River+42";
+  handleMagicInviteLink();
+  assert.strictEqual(switchModal.hidden, false, "Switch kitchen dialog shown when different code in magic link");
+  const cancelBtn = document.querySelector("#switch-kitchen-cancel-btn");
+  cancelBtn.onclick(); // Click "Stay in my kitchen"
+  assert.strictEqual(switchModal.hidden, true, "Modal closed after cancel");
+  assert.strictEqual(localStorage.getItem(ACCESS_TOKEN_STORAGE), "River Bend 7", "Old code preserved when canceled");
+
+  // Confirm switch via magic link
+  global.window.location.search = "?household=Maple+River+42";
+  handleMagicInviteLink();
+  assert.strictEqual(switchModal.hidden, false, "Switch kitchen dialog shown again");
+  const confirmBtn = document.querySelector("#switch-kitchen-confirm-btn");
+  confirmBtn.onclick(); // Click "Switch"
+  assert.strictEqual(switchModal.hidden, true, "Modal closed after switch");
+  assert.strictEqual(localStorage.getItem(ACCESS_TOKEN_STORAGE), "Maple River 42", "New code applied after confirmation");
+
+  console.log("✓ Test 17 Passed: Mom-proof onboarding, default URL collapsing, and magic invite link handling with cleanup and guard");
+  passed++;
+
+  // Test 18: Milestone 7 Part 3 — Named kitchens & wrong-kitchen guard
+  // 1. Name prompt appears on fresh hosted-mode first run
+  localStorage.clear();
+  sessionStorage.clear();
+  state.kitchenName = "";
+  setHostedDefaultServerUrl("https://pantry-space.hf.space");
+  localStorage.setItem(SERVER_URL_STORAGE, "https://pantry-space.hf.space");
+  localStorage.setItem(ACCESS_TOKEN_STORAGE, "Maple River 42");
+  setConnectionState("CONNECTED");
+
+  const nameModal = document.querySelector("#name-onboarding-modal");
+  nameModal.hidden = true;
+  checkNameOnboardingPrompt();
+  assert.strictEqual(nameModal.hidden, false, "Name onboarding prompt appears on fresh hosted-mode run");
+
+  // Form "<Name>'s Kitchen" and save to server
+  const nameInput = document.querySelector("#onboarding-name-input");
+  nameInput.value = "Mike";
+  fetchHandler = async (url, opts) => {
+    if (url.includes("/api/household/name")) {
+      const body = JSON.parse(opts.body);
+      assert.strictEqual(body.kitchen_name, "Mike's Kitchen", "Display name formed as '<Name>'s Kitchen'");
+      return {
+        ok: true,
+        status: 200,
+        headers: { get: () => "application/json" },
+        json: async () => ({ kitchen_name: body.kitchen_name, created: true })
+      };
+    }
+    return { ok: true, status: 200, headers: { get: () => "application/json" }, json: async () => ({}) };
+  };
+
+  await submitNameOnboarding();
+  assert.strictEqual(nameModal.hidden, true, "Modal hidden after name submission");
+  assert.strictEqual(state.kitchenName, "Mike's Kitchen", "state.kitchenName set to Mike's Kitchen");
+  assert.strictEqual(localStorage.getItem(KITCHEN_NAME_STORAGE), "Mike's Kitchen", "Kitchen name persisted in localStorage");
+
+  // 2. Names are data, never markup: apostrophe and angle brackets
+  state.kitchenName = "Mike O'Brien's Kitchen";
+  renderKitchenName();
+  const bannerEl = document.querySelector("#kitchen-name-banner");
+  assert.strictEqual(bannerEl.textContent, "You're in: Mike O'Brien's Kitchen", "Apostrophe rendered correctly in banner");
+
+  state.kitchenName = "<b>x</b>'s Kitchen";
+  renderKitchenName();
+  assert.strictEqual(bannerEl.textContent, "You're in: <b>x</b>'s Kitchen", "Angle brackets rendered as plain text in banner");
+  assert.strictEqual(bannerEl.children.length, 0, "No HTML tags parsed into child DOM nodes");
+
+  // 3. Second device with same code does not overwrite and sees existing name
+  fetchHandler = async (url, opts) => {
+    if (url.includes("/api/household/name")) {
+      return {
+        ok: true,
+        status: 200,
+        headers: { get: () => "application/json" },
+        json: async () => ({ kitchen_name: "Mike's Kitchen", created: false })
+      };
+    }
+    return { ok: true, status: 200, headers: { get: () => "application/json" }, json: async () => ({}) };
+  };
+  nameInput.value = "Alice";
+  await submitNameOnboarding();
+  assert.strictEqual(state.kitchenName, "Mike's Kitchen", "Second device receives and retains existing kitchen name");
+
+  // 4. Skip for now and Settings set-later path (only while unnamed)
+  localStorage.clear();
+  sessionStorage.clear();
+  setHostedDefaultServerUrl("https://pantry-space.hf.space");
+  localStorage.setItem(SERVER_URL_STORAGE, "https://pantry-space.hf.space");
+  localStorage.setItem(ACCESS_TOKEN_STORAGE, "Maple River 42");
+  setConnectionState("CONNECTED");
+  state.kitchenName = "";
+  renderKitchenName();
+  checkNameOnboardingPrompt();
+  assert.strictEqual(nameModal.hidden, false, "Modal opened for unnamed kitchen");
+  skipNameOnboarding();
+  assert.strictEqual(nameModal.hidden, true, "Modal closed on skip");
+  assert.strictEqual(sessionStorage.getItem("name_onboarding_skipped"), "true", "Skip recorded in sessionStorage");
+  assert.strictEqual(state.kitchenName, "", "Kitchen remains unnamed on skip");
+
+  const settingsNameInput = document.querySelector("#settings-kitchen-name-input");
+  const settingsNameBtn = document.querySelector("#settings-kitchen-name-btn");
+  renderKitchenName();
+  assert.strictEqual(settingsNameInput.readOnly, false, "Settings input editable while unnamed");
+  assert.strictEqual(settingsNameBtn.hidden, false, "Settings save button visible while unnamed");
+
+  settingsNameInput.value = "Grandma";
+  fetchHandler = async (url, opts) => {
+    if (url.includes("/api/household/name")) {
+      return {
+        ok: true,
+        status: 200,
+        headers: { get: () => "application/json" },
+        json: async () => ({ kitchen_name: "Grandma's Kitchen", created: true })
+      };
+    }
+    return { ok: true, status: 200, headers: { get: () => "application/json" }, json: async () => ({}) };
+  };
+  await saveKitchenNameFromSettings();
+  assert.strictEqual(state.kitchenName, "Grandma's Kitchen", "Kitchen named Grandma's Kitchen from settings");
+  assert.strictEqual(settingsNameInput.readOnly, true, "Settings input now locked (readOnly)");
+  assert.strictEqual(settingsNameBtn.hidden, true, "Settings save button now hidden");
+
+  // 5. Wrong-kitchen guard on manual code change
+  document.querySelector("#server-url-input").value = "https://pantry-space.hf.space";
+  document.querySelector("#server-token-input").value = "Oak Ridge 99";
+  fetchHandler = async () => ({ ok: true, status: 200, headers: { get: () => "application/json" }, json: async () => ({ ok: true, status: "ok", app: "pantry-planner" }) });
+  await saveServerSettings();
+  assert.strictEqual(switchModal.hidden, false, "Switch kitchen dialog triggered on manual code change");
+  assert.ok(
+    rawHtml.includes("This opens a different kitchen than the one you used before. Switch kitchens?"),
+    "Exact switch dialog body copy in index.html"
+  );
+  assert.ok(rawHtml.includes(">Stay in my kitchen</button>"), "Cancel button copy matches exactly");
+  assert.ok(rawHtml.includes(">Switch</button>"), "Confirm button copy matches exactly");
+  cancelBtn.onclick();
+  assert.strictEqual(localStorage.getItem(ACCESS_TOKEN_STORAGE), "Maple River 42", "Token untouched when switch canceled");
+
+  document.querySelector("#server-token-input").value = "Oak Ridge 99";
+  await saveServerSettings();
+  confirmBtn.onclick();
+  await new Promise((r) => setTimeout(r, 20));
+  assert.strictEqual(localStorage.getItem(ACCESS_TOKEN_STORAGE), "Oak Ridge 99", "New code applied when switch confirmed");
+
+  // 6. LAN / single-household mode: unchanged — no name prompt, no switch dialog
+  setHostedDefaultServerUrl("");
+  localStorage.setItem(SERVER_URL_STORAGE, "http://192.168.1.100:8001");
+  localStorage.setItem(ACCESS_TOKEN_STORAGE, "lan-token-1");
+  setConnectionState("CONNECTED");
+  state.kitchenName = "";
+  sessionStorage.clear();
+  nameModal.hidden = true;
+  switchModal.hidden = true;
+
+  assert.strictEqual(isHostedMode(), false, "LAN server URL is not hosted mode");
+  checkNameOnboardingPrompt();
+  assert.strictEqual(nameModal.hidden, true, "LAN mode NEVER prompts for kitchen name");
+
+  document.querySelector("#server-url-input").value = "http://192.168.1.100:8001";
+  document.querySelector("#server-token-input").value = "lan-token-2";
+  await saveServerSettings();
+  assert.strictEqual(switchModal.hidden, true, "LAN mode NEVER shows switch kitchens dialog");
+  assert.strictEqual(localStorage.getItem(ACCESS_TOKEN_STORAGE), "lan-token-2", "LAN token updated directly without dialog");
+
+  console.log("✓ Test 18 Passed: Named kitchens ('<Name>'s Kitchen'), markup safety, first-set-wins, settings lock, and LAN isolation");
   passed++;
 
   console.log(`\nAll ${passed} Mobile Client tests passed successfully!`);
