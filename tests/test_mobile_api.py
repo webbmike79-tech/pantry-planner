@@ -300,7 +300,108 @@ class TestMobileApi(unittest.TestCase):
         shop_items = [i["item_name"] for i in payload["plan"]["shopping_list"]]
         self.assertEqual(shop_items, ["Avocados", "Sourdough Bread"])
 
+    def test_swap_meal_changes_only_target_slot_and_records_changed_from(self):
+        """Meal swap changes only target slot, preserves other meals/shopping, and records changed_from."""
+        from unittest.mock import patch
+        from api.main import save_plan, add_inventory_items, DetectedItem, MealSwapOutput, UsedIngredient
+
+        # Seed inventory with on-hand items: Eggs and Cheese
+        add_inventory_items("Fridge", [
+            DetectedItem(item_name="Eggs", category="Protein", quantity=12.0, unit="count"),
+            DetectedItem(item_name="Cheddar Cheese", category="Dairy", quantity=8.0, unit="oz"),
+        ])
+
+        # Save an initial plan with Monday breakfast
+        initial_plan = {
+            "menu": [
+                {
+                    "day": "Monday",
+                    "headcount": 2,
+                    "breakfast": {"dish_name": "Oatmeal with Berries", "cook_time_minutes": 10, "prep_steps": ["Boil oats"]},
+                    "lunch": {"dish_name": "Turkey Wrap", "cook_time_minutes": 5, "prep_steps": ["Roll wrap"]},
+                    "dinner": {"dish_name": "Baked Salmon", "cook_time_minutes": 25, "prep_steps": ["Bake salmon"]},
+                    "ingredients_to_deduct": [],
+                    "cooked": False,
+                }
+            ],
+            "shopping_list": [
+                {"item_name": "Salmon", "amount_needed": "1 lb", "numeric_quantity": 1.0, "unit": "lb", "purchased": False}
+            ],
+            "nutrition_notes": "Balanced meals",
+        }
+        save_plan(initial_plan)
+
+        mock_swap = MealSwapOutput(
+            found=True,
+            dish_name="Cheese Omelet",
+            prep_steps=["Whisk eggs", "Melt cheese in pan"],
+            cook_time_minutes=12,
+            ingredients_used=[
+                UsedIngredient(inventory_id=1, item_name="Eggs", amount_used=4.0, unit="count"),
+                UsedIngredient(inventory_id=2, item_name="Cheddar Cheese", amount_used=2.0, unit="oz"),
+            ],
+        )
+
+        with patch("api.main.swap_single_meal", return_value=(mock_swap, "gemini")):
+            res = self.client.post(
+                "/api/plan/swap-meal",
+                json={"day_index": 0, "meal_slot": "breakfast"},
+                headers={"X-Gemini-Key": "dummy-key"},
+            )
+            self.assertEqual(res.status_code, 200)
+            data = res.json()
+            self.assertTrue(data["success"])
+            self.assertEqual(data["served_by"], "gemini")
+
+            updated_menu = data["plan"]["menu"]
+            # Target slot changed
+            self.assertEqual(updated_menu[0]["breakfast"]["dish_name"], "Cheese Omelet")
+            self.assertEqual(updated_menu[0]["breakfast"]["changed_from"], "Oatmeal with Berries")
+            # Other meals in the week untouched
+            self.assertEqual(updated_menu[0]["lunch"]["dish_name"], "Turkey Wrap")
+            self.assertEqual(updated_menu[0]["dinner"]["dish_name"], "Baked Salmon")
+            # Shopping list untouched
+            self.assertEqual(len(data["plan"]["shopping_list"]), 1)
+            self.assertEqual(data["plan"]["shopping_list"][0]["item_name"], "Salmon")
+
+    def test_swap_meal_no_on_hand_leaves_original_meal_untouched(self):
+        """When no on-hand alternative satisfies the rules, original meal is left in place."""
+        from unittest.mock import patch
+        from api.main import save_plan, MealSwapOutput
+
+        initial_plan = {
+            "menu": [
+                {
+                    "day": "Monday",
+                    "headcount": 2,
+                    "breakfast": {"dish_name": "Pancakes", "cook_time_minutes": 15, "prep_steps": ["Mix batter"]},
+                    "lunch": None,
+                    "dinner": None,
+                    "ingredients_to_deduct": [],
+                    "cooked": False,
+                }
+            ],
+            "shopping_list": [],
+            "nutrition_notes": "Standard",
+        }
+        save_plan(initial_plan)
+
+        # Inventory is empty, so swap_meal should report not found
+        res = self.client.post(
+            "/api/plan/swap-meal",
+            json={"day_index": 0, "meal_slot": "breakfast"},
+            headers={"X-Gemini-Key": "dummy-key"},
+        )
+        self.assertEqual(res.status_code, 200)
+        data = res.json()
+        self.assertFalse(data["success"])
+        self.assertEqual(data["message"], "Nothing else on hand fits this slot")
+        # Meal is untouched
+        self.assertEqual(data["plan"]["menu"][0]["breakfast"]["dish_name"], "Pancakes")
+        self.assertIsNone(data["plan"]["menu"][0]["breakfast"].get("changed_from"))
+
 
 if __name__ == "__main__":
     unittest.main()
+
 

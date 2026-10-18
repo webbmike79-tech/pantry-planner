@@ -38,11 +38,11 @@ global.sessionStorage = new LocalStorageMock();
 const domElements = {};
 function getOrCreateElement(id) {
   if (!domElements[id]) {
-    domElements[id] = {
+    const el = {
       id,
       value: "",
       textContent: "",
-      innerHTML: "",
+      _innerHTML: "",
       className: "",
       classList: {
         classes: new Set(),
@@ -55,13 +55,30 @@ function getOrCreateElement(id) {
       style: {},
       disabled: false,
       dataset: {},
+      children: [],
       addEventListener() {},
-      appendChild() {},
+      appendChild(child) { this.children.push(child); },
       scrollIntoView() {},
       focus() {},
-      querySelector(s) { return getOrCreateElement("child_" + s); },
+      querySelector(s) {
+        if (s.startsWith(".")) {
+          const cls = s.slice(1);
+          for (const ch of this.children) {
+            if (ch.innerHTML && ch.innerHTML.includes(cls)) return ch;
+          }
+        }
+        return getOrCreateElement("child_" + s);
+      },
       querySelectorAll() { return []; },
     };
+    Object.defineProperty(el, "innerHTML", {
+      get() { return this._innerHTML; },
+      set(val) {
+        this._innerHTML = val;
+        if (val === "") this.children = [];
+      }
+    });
+    domElements[id] = el;
   }
   return domElements[id];
 }
@@ -70,6 +87,14 @@ global.document = {
   querySelector(sel) {
     if (sel.startsWith("#")) {
       return getOrCreateElement(sel.slice(1));
+    }
+    const wrap = getOrCreateElement("menu-days");
+    if (wrap && wrap.children) {
+      for (const card of wrap.children) {
+        if (card.innerHTML && card.innerHTML.includes(sel.replace(".", ""))) {
+          return card;
+        }
+      }
     }
     return getOrCreateElement("mock_" + sel.replace(/[^a-zA-Z0-9]/g, "_"));
   },
@@ -312,6 +337,34 @@ async function runTests() {
   );
   assert.strictEqual(document.querySelectorAll("#shopping-list .shop-item").length, 0);
   console.log("✓ Test 10 Passed: Clean first-run shopping list is empty with exact required guidance message");
+  // Test 11: Meal swap rendering: changed_from note renders and clears on full re-plan
+  state.plan = {
+    menu: [
+      {
+        day: "Monday",
+        headcount: 2,
+        breakfast: { dish_name: "Tofu Scramble", changed_from: "Old Scramble", prep_steps: ["Scramble tofu"], cook_time_minutes: 10 },
+        lunch: null,
+        dinner: null,
+        ingredients_to_deduct: [],
+        cooked: false,
+      }
+    ],
+    shopping_list: []
+  };
+  renderMenu();
+  const mealHeader = document.querySelector(".meal-header");
+  assert.ok(mealHeader, "Meal header renders");
+  const changedNote = document.querySelector(".changed-note");
+  assert.ok(changedNote, "Changed from note renders");
+  assert.strictEqual(changedNote.innerHTML.includes("Old Scramble"), true, "Note shows previous meal");
+
+  // On full re-plan, meal without changed_from clears note
+  state.plan.menu[0].breakfast = { dish_name: "Fresh Omelet", prep_steps: ["Cook"], cook_time_minutes: 5 };
+  renderMenu();
+  const clearedNote = document.querySelector(".changed-note");
+  assert.strictEqual(clearedNote.innerHTML, "", "Changed from note cleared on new meal");
+  console.log("✓ Test 11 Passed: Meal swap Changed-from note renders and clears on re-plan");
   passed++;
 
   console.log(`\nAll ${passed} Mobile Client tests passed successfully!`);
