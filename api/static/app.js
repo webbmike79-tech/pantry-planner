@@ -1187,6 +1187,26 @@ function renderAll() {
 }
 
 function init() {
+  // Service Worker policy:
+  // Inside Capacitor, never run a Service Worker (Capacitor serves assets locally; SW caches cause stale asset bugs).
+  // Purge any existing SW registrations and CacheStorage left from previous versions.
+  if (isCapacitor()) {
+    if ("serviceWorker" in navigator) {
+      navigator.serviceWorker.getRegistrations().then((regs) => {
+        for (const reg of regs) {
+          reg.unregister();
+        }
+      }).catch(() => {});
+    }
+    if ("caches" in window) {
+      caches.keys().then((keys) => {
+        for (const k of keys) {
+          caches.delete(k);
+        }
+      }).catch(() => {});
+    }
+  }
+
   buildDietForm();
   wireTabs();
 
@@ -1370,7 +1390,7 @@ function init() {
   startHeartbeat();
   refreshAll();
 
-  if ("serviceWorker" in navigator) {
+  if (!isCapacitor() && "serviceWorker" in navigator) {
     navigator.serviceWorker.register("sw.js").catch(() => { /* offline support optional */ });
   }
 }
