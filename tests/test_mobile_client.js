@@ -998,6 +998,144 @@ async function runTests() {
   console.log("✓ Test 18 Passed: Named kitchens ('<Name>'s Kitchen'), markup safety, first-set-wins, settings lock, and LAN isolation");
   passed++;
 
+  // Test 19: Per-day servings
+  setHostedDefaultServerUrl("");
+  localStorage.removeItem(SERVER_URL_STORAGE);
+  localStorage.removeItem(ACCESS_TOKEN_STORAGE);
+  setConnectionState("DISCONNECTED");
+  fetchHandler = null;
+  await new Promise((r) => setTimeout(r, 50));
+
+  // 1. Initial display at household size
+  state.settings = { base_headcount: 3 };
+  state.plan = {
+    menu: [
+      {
+        day: "Monday",
+        headcount: 3,
+        servings: 3,
+        is_overridden: false,
+        breakfast: { dish_name: "Oatmeal" },
+        lunch: { dish_name: "Salad" },
+        dinner: { dish_name: "Pasta" },
+        ingredients_to_deduct: []
+      }
+    ],
+    shopping_list: []
+  };
+  renderMenu();
+  const menuWrap = document.querySelector("#menu-days");
+  assert.ok(menuWrap.children.length > 0, "Menu card rendered");
+  let mondayCardHtml = menuWrap.children[0].innerHTML;
+  assert.ok(mondayCardHtml.includes("Serves: 3"), "Day card shows Serves: 3");
+  assert.ok(!mondayCardHtml.includes("· custom"), "Non-overridden day does not show custom pill");
+  assert.ok(!mondayCardHtml.includes("Reset to household"), "Non-overridden day does not show reset button");
+  assert.ok(mondayCardHtml.includes("servings-minus"), "Minus stepper present");
+  assert.ok(mondayCardHtml.includes("servings-plus"), "Plus stepper present");
+
+  // 2. Direct edit (Thanksgiving day 3 -> 7): custom tag, reset link, rescaling
+  setConnectionState("DISCONNECTED");
+  state.plan = {
+    menu: [
+      {
+        day: "Thursday",
+        headcount: 3,
+        servings: 3,
+        is_overridden: false,
+        ingredients_to_deduct: [
+          { item_name: "Chicken Broth", amount_used: 1.0, unit: "cup" },
+          { item_name: "Eggs", amount_used: 2.0, unit: "egg" }
+        ],
+        breakfast: {}, lunch: {}, dinner: {}
+      },
+      {
+        day: "Friday",
+        headcount: 3,
+        servings: 3,
+        is_overridden: false,
+        ingredients_to_deduct: [
+          { item_name: "Rice", amount_used: 1.0, unit: "cup" }
+        ],
+        breakfast: {}, lunch: {}, dinner: {}
+      }
+    ],
+    shopping_list: [
+      { item_name: "Pumpkin Puree", numeric_quantity: 1.0, amount_needed: "1 can", unit: "can", reason: "For Thursday Dinner" },
+      { item_name: "Turkey Breast", numeric_quantity: 1.5, amount_needed: "1.5 lbs", unit: "lbs", reason: "For Thursday Dinner" },
+      { item_name: "Fresh Parsley", numeric_quantity: 1.0, amount_needed: "a pinch", unit: "pinch", reason: "For Thursday Dinner garnish" },
+      { item_name: "Rolled Oats", numeric_quantity: 2.0, amount_needed: "2 cups", unit: "cups", reason: "For Monday Breakfast" }
+    ]
+  };
+  renderMenu();
+
+  await changeDayServings(0, 7);
+  assert.strictEqual(state.plan.menu[0].servings, 7, "Thursday servings updated to 7");
+  assert.strictEqual(state.plan.menu[0].is_overridden, true, "Thursday marked overridden");
+  assert.strictEqual(state.plan.menu[1].servings, 3, "Friday servings untouched at 3");
+  assert.strictEqual(state.plan.menu[1].is_overridden, false, "Friday not overridden");
+
+  let thursdayCardHtml = menuWrap.children[0].innerHTML;
+  assert.ok(thursdayCardHtml.includes("Serves 7 · custom"), "Overridden card displays 'Serves 7 · custom'");
+  assert.ok(thursdayCardHtml.includes("Reset to household"), "Overridden card shows 'Reset to household' link");
+
+  // Quantity rescaling verification:
+  // Fractional (cup): 1.0 * (7/3) = 2.333 -> 2.25
+  assert.strictEqual(state.plan.menu[0].ingredients_to_deduct[0].amount_used, 2.25, "Broth scaled 1.0 -> 2.25 cups (0.25 round)");
+  // Countable (egg): 2.0 * (7/3) = 4.666 -> ceil -> 5.0
+  assert.strictEqual(state.plan.menu[0].ingredients_to_deduct[1].amount_used, 5.0, "Eggs scaled 2.0 -> 5.0 eggs (ceil round)");
+  // Other day untouched:
+  assert.strictEqual(state.plan.menu[1].ingredients_to_deduct[0].amount_used, 1.0, "Friday rice untouched at 1.0 cup");
+  // Shopping list:
+  const pumpkin = state.plan.shopping_list.find(i => i.item_name === "Pumpkin Puree");
+  assert.strictEqual(pumpkin.numeric_quantity, 3.0, "Pumpkin scaled 1 -> 3 cans");
+  assert.ok(pumpkin.amount_needed.startsWith("3"), "Pumpkin amount_needed scaled to 3 cans");
+  const turkey = state.plan.shopping_list.find(i => i.item_name === "Turkey Breast");
+  assert.strictEqual(turkey.numeric_quantity, 3.5, "Turkey scaled 1.5 -> 3.5 lbs");
+  assert.strictEqual(turkey.amount_needed, "3.5 lbs", "Turkey amount_needed scaled to 3.5 lbs");
+  const parsley = state.plan.shopping_list.find(i => i.item_name === "Fresh Parsley");
+  assert.strictEqual(parsley.amount_needed, "a pinch", "Free text quantity 'a pinch' left unchanged");
+  const oats = state.plan.shopping_list.find(i => i.item_name === "Rolled Oats");
+  assert.strictEqual(oats.numeric_quantity, 2.0, "Oats for Monday untouched");
+
+  // 3. Reset to household link
+  await resetDayServings(0);
+  assert.strictEqual(state.plan.menu[0].servings, 3, "Thursday reset to household size (3)");
+  assert.strictEqual(state.plan.menu[0].is_overridden, false, "Thursday override cleared");
+  thursdayCardHtml = menuWrap.children[0].innerHTML;
+  assert.ok(thursdayCardHtml.includes("Serves: 3"), "Card back to Serves: 3");
+  assert.ok(!thursdayCardHtml.includes("· custom"), "Custom pill gone");
+  assert.ok(!thursdayCardHtml.includes("Reset to household"), "Reset link gone");
+
+  // 4. Mid-week household change: overrides survive, non-overridden update
+  await changeDayServings(0, 7); // Thursday is overridden to 7
+  applyHouseholdSizeChange(4); // Household changes 3 -> 4
+  assert.strictEqual(state.plan.menu[0].servings, 7, "Overridden Thursday preserves 7");
+  assert.strictEqual(state.plan.menu[0].is_overridden, true, "Thursday stays overridden");
+  assert.strictEqual(state.plan.menu[1].servings, 4, "Non-overridden Friday updates to new household size 4");
+  assert.strictEqual(state.plan.menu[1].is_overridden, false, "Friday remains not overridden");
+
+  // 5. Migration of pre-feature saved plans (no servings fields)
+  state.plan = {
+    menu: [
+      {
+        day: "Saturday",
+        headcount: 4,
+        breakfast: {}, lunch: {}, dinner: {},
+        ingredients_to_deduct: []
+      }
+    ],
+    shopping_list: []
+  };
+  state.settings = { base_headcount: 4 };
+  renderMenu();
+  assert.strictEqual(state.plan.menu[0].servings, 4, "Pre-feature plan migrates servings to headcount 4");
+  assert.strictEqual(state.plan.menu[0].is_overridden, false, "Pre-feature plan migrates is_overridden to false");
+  const satCardHtml = menuWrap.children[0].innerHTML;
+  assert.ok(satCardHtml.includes("Serves: 4"), "Pre-feature card renders cleanly with Serves: 4");
+
+  console.log("✓ Test 19 Passed: Per-day servings (day card stepper, custom indicator, reset link, rounding/scaling, mid-week sync, migration)");
+  passed++;
+
   console.log(`\nAll ${passed} Mobile Client tests passed successfully!`);
 }
 
