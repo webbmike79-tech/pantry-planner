@@ -360,14 +360,23 @@ async function runTests() {
   console.log("✓ Test 7 Passed: All destructive actions safely blocked while offline");
   passed++;
 
-  // Test 8: Key ownership rule: connected mode never blocks on client keys
+  // Test 8: Key ownership rule: connected mode never blocks on client keys & hides standalone key UI
   setConnectionState("CONNECTED");
   localStorage.removeItem(KEY_STORAGE);
   localStorage.removeItem(GROQ_KEY_STORAGE);
   localStorage.removeItem(OPENROUTER_KEY_STORAGE);
   assert.strictEqual(hasKey(), false, "Client has no local keys stored");
   assert.strictEqual(requireKey(), true, "Connected mode permits AI operations without client keys");
-  console.log("✓ Test 8 Passed: Connected mode never prompts for or blocks on client keys");
+  assert.strictEqual(document.querySelector("#standalone-keys-section").hidden, true, "Standalone keys UI hidden when connected");
+  assert.strictEqual(document.querySelector("#connected-keys-notice").hidden, false, "Connected AI notice visible when connected");
+
+  // In standalone mode (no server URL), standalone keys UI is shown
+  localStorage.removeItem(SERVER_URL_STORAGE);
+  setConnectionState("DISCONNECTED");
+  assert.strictEqual(document.querySelector("#standalone-keys-section").hidden, false, "Standalone keys UI shown in standalone mode");
+  assert.strictEqual(document.querySelector("#connected-keys-notice").hidden, true, "Connected AI notice hidden in standalone mode");
+
+  console.log("✓ Test 8 Passed: Connected mode never prompts for or blocks on client keys and manages key UI visibility");
   passed++;
 
   // Test 9: Key persistence in localStorage survives across simulated restarts
