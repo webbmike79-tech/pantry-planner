@@ -400,6 +400,56 @@ class TestMobileApi(unittest.TestCase):
         self.assertEqual(data["plan"]["menu"][0]["breakfast"]["dish_name"], "Pancakes")
         self.assertIsNone(data["plan"]["menu"][0]["breakfast"].get("changed_from"))
 
+    def test_clear_plan_deletes_saved_plan_without_touching_inventory_or_settings(self):
+        """DELETE /api/plan deletes the plan and shopping list while leaving inventory and settings untouched."""
+        from api.main import save_plan, get_latest_plan, get_inventory, get_settings, add_inventory_items, DetectedItem
+
+        # 1. Populate inventory
+        add_inventory_items("Fridge", [DetectedItem(item_name="Almond Milk", quantity=1.0, unit="bottle", category="Dairy")])
+        initial_inv = get_inventory()
+        self.assertEqual(len(initial_inv), 1)
+
+        # 2. Populate plan with shopping list
+        initial_plan = {
+            "menu": [
+                {
+                    "day": "Monday",
+                    "headcount": 2,
+                    "breakfast": {"dish_name": "Oatmeal", "changed_from": "Toast"},
+                    "lunch": None,
+                    "dinner": None,
+                    "ingredients_to_deduct": [],
+                    "cooked": False,
+                }
+            ],
+            "shopping_list": [{"item_name": "Oats", "quantity": 1, "unit": "can", "category": "Pantry/Dry", "purchased": False}],
+            "nutrition_notes": "Healthy",
+        }
+        save_plan(initial_plan)
+        p_id, _, p_data = get_latest_plan()
+        self.assertIsNotNone(p_id)
+        self.assertIsNotNone(p_data)
+
+        # 3. Call DELETE /api/plan
+        res = self.client.delete("/api/plan")
+        self.assertEqual(res.status_code, 200)
+        data = res.json()
+        self.assertIsNone(data["plan_id"])
+        self.assertIsNone(data["plan"])
+
+        # 4. Verify plan is gone in DB
+        check_id, _, check_plan = get_latest_plan()
+        self.assertIsNone(check_id)
+        self.assertIsNone(check_plan)
+
+        # 5. Verify inventory and settings were untouched
+        inv_after = get_inventory()
+        self.assertEqual(len(inv_after), 1)
+        self.assertEqual(inv_after[0]["item_name"], "Almond Milk")
+
+        settings_after = get_settings()
+        self.assertIsNotNone(settings_after)
+
 
 if __name__ == "__main__":
     unittest.main()

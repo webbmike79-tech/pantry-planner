@@ -470,6 +470,98 @@ async function runTests() {
   console.log("✓ Test 13 Passed: Dedicated On Hand view (Fridge/Freezer/Pantry grouping, alphabetical, 'out' badge, jump-to-editor)");
   passed++;
 
+  // Test 14: Clear menu button, exact confirmation copy, and plan clearing in connected & standalone modes
+  const clearTestPlan = {
+    menu: [
+      {
+        day: "Monday",
+        headcount: 2,
+        breakfast: { dish_name: "Oatmeal", changed_from: "Pancakes" },
+        lunch: { dish_name: "Salad" },
+        dinner: { dish_name: "Pasta" },
+        cooked: false,
+      }
+    ],
+    shopping_list: [{ item_name: "Oats", quantity: 1, unit: "can", category: "Pantry/Dry" }],
+    nutrition_notes: "Whole foods",
+  };
+  state.plan = clearTestPlan;
+  state.planId = 42;
+  state.planCreatedAt = "2026-10-18 10:00";
+  state.inventory = [{ id: 1, item_name: "Milk", quantity: 2, unit: "bottle", location: "Fridge" }];
+  state.settings = { base_headcount: 2, dietary_tags: ["Balanced"] };
+
+  // 1. Render plan -> Clear menu button must be visible
+  renderMenu();
+  const clearBtn = document.querySelector("#clear-menu-btn");
+  assert.ok(clearBtn, "Clear menu button exists in DOM");
+  assert.strictEqual(clearBtn.style.display, "inline-block", "Clear menu button is visible when a plan exists");
+
+  // 2. Open confirmation modal -> check exact required copy from index.html and element wiring
+  const indexHtml = fs.readFileSync(path.join(__dirname, "../api/static/index.html"), "utf8");
+  assert.ok(indexHtml.includes("Start over with a fresh menu?"), "Modal title matches exact required copy");
+  assert.ok(
+    indexHtml.includes("This clears your current 7-day menu and the shopping list built from it. Your stocked inventory, receipts, and settings stay exactly as they are."),
+    "Modal body matches exact required copy"
+  );
+  assert.ok(indexHtml.includes(">Keep my menu</button>"), "Cancel button matches exact required copy");
+  assert.ok(indexHtml.includes(">Clear it</button>"), "Confirm button matches exact required copy");
+
+  showClearMenuModal();
+  const clearModal = document.querySelector("#clear-menu-modal");
+  assert.strictEqual(clearModal.hidden, false, "Clear menu modal is displayed");
+
+  // 3. Cancel leaves plan completely untouched
+  hideClearMenuModal();
+  assert.strictEqual(clearModal.hidden, true, "Modal closed on cancel");
+  assert.strictEqual(state.plan, clearTestPlan, "Plan left untouched on cancel");
+  assert.strictEqual(state.inventory.length, 1, "Inventory untouched on cancel");
+
+  // 4. Confirm in connected mode deletes plan on server and clears view
+  setConnectionState("CONNECTED");
+  let serverDeleteCalled = false;
+  fetchHandler = async (url, opts) => {
+    if (url.endsWith("/api/plan") && opts.method === "DELETE") {
+      serverDeleteCalled = true;
+      return {
+        ok: true,
+        status: 200,
+        headers: { get: () => "application/json" },
+        json: async () => ({ plan_id: null, created_at: null, plan: null })
+      };
+    }
+    return { ok: true, status: 200, headers: { get: () => "application/json" }, json: async () => ({}) };
+  };
+
+  await confirmClearMenu();
+  assert.strictEqual(serverDeleteCalled, true, "DELETE /api/plan called on server in connected mode");
+  assert.strictEqual(state.plan, null, "state.plan is null after clearing");
+  assert.strictEqual(state.planId, null, "state.planId is null after clearing");
+  assert.strictEqual(clearBtn.style.display, "none", "Clear menu button hidden when no plan exists");
+  assert.strictEqual(document.querySelector("#menu-empty").style.display, "block", "Menu empty state renders");
+  assert.strictEqual(
+    document.querySelector("#shopping-empty").textContent,
+    "No menu planned yet — your shopping list will build from your plan.",
+    "Shopping list returns to clean empty state guidance"
+  );
+  // Verify inventory & settings were NEVER touched
+  assert.strictEqual(state.inventory.length, 1, "Inventory preserved untouched");
+  assert.strictEqual(state.inventory[0].item_name, "Milk", "Inventory item preserved untouched");
+  assert.strictEqual(state.settings.base_headcount, 2, "Settings preserved untouched");
+
+  // 5. Standalone mode clear
+  setConnectionState("DISCONNECTED");
+  state.plan = clearTestPlan;
+  state.planId = 99;
+  renderMenu();
+  assert.strictEqual(clearBtn.style.display, "inline-block");
+  await confirmClearMenu();
+  assert.strictEqual(state.plan, null, "Standalone mode clears local plan");
+  assert.strictEqual(clearBtn.style.display, "none", "Clear menu button hidden after standalone clear");
+
+  console.log("✓ Test 14 Passed: Clear menu button, confirmation copy, plan deletion, and inventory/settings isolation");
+  passed++;
+
   console.log(`\nAll ${passed} Mobile Client tests passed successfully!`);
 }
 
