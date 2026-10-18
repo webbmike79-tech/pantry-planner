@@ -367,6 +367,15 @@ async function runTests() {
   console.log("✓ Test 11 Passed: Meal swap Changed-from note renders and clears on re-plan");
   passed++;
 
+  // Test 12: Pull-to-refresh indicator and header refresh button exist
+  const headerRefreshBtn = document.querySelector("#header-refresh-btn");
+  assert.ok(headerRefreshBtn, "Header refresh button exists");
+  const ptrIndicator = document.querySelector("#ptr-indicator");
+  assert.ok(ptrIndicator, "Pull-to-refresh indicator exists");
+  assert.strictEqual(typeof setupPullToRefresh, "function", "setupPullToRefresh is defined");
+  console.log("✓ Test 12 Passed: Pull-to-refresh indicator and header refresh controls present");
+  passed++;
+
   console.log(`\nAll ${passed} Mobile Client tests passed successfully!`);
 }
 
@@ -374,3 +383,4 @@ runTests().catch((err) => {
   console.error("Test failed:", err);
   process.exit(1);
 });
+

@@ -89,7 +89,10 @@
 </div>
 
 <header class="app-header">
-  <h1>🥘 Pantry Planner</h1>
+  <div class="header-top">
+    <h1>🥘 Pantry Planner</h1>
+    <button id="header-refresh-btn" class="header-refresh-btn" type="button" title="Refresh all data" aria-label="Refresh">🔄</button>
+  </div>
   <div class="banner">🎃 Spooky Harvest Kitchen Mode</div>
   <div class="status-bar">
     <div class="stat"><span class="stat-num" id="stat-stock">0</span><span class="stat-label">📦 Stocked</span></div>
@@ -108,6 +111,11 @@
     <button id="banner-retry-btn" class="banner-btn" type="button">Retry</button>
     <button id="banner-settings-btn" class="banner-btn" type="button">Settings</button>
   </div>
+</div>
+
+<div id="ptr-indicator" class="ptr-indicator">
+  <span class="ptr-icon">↓</span>
+  <span class="ptr-text">Pull to refresh…</span>
 </div>
 
 <main>

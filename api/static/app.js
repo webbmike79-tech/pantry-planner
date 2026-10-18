@@ -1433,6 +1433,22 @@ function init() {
   $("#receipt-pdf-btn").addEventListener("click", scanReceiptPdf);
   $("#receipt-paste-btn").addEventListener("click", pasteReceiptText);
 
+  /* Header refresh button */
+  const headerRefreshBtn = $("#header-refresh-btn");
+  if (headerRefreshBtn) {
+    headerRefreshBtn.addEventListener("click", async () => {
+      headerRefreshBtn.classList.add("spinning");
+      try {
+        await refreshAll(false);
+        toast("Refreshed! ✅");
+      } finally {
+        headerRefreshBtn.classList.remove("spinning");
+      }
+    });
+  }
+
+  setupPullToRefresh();
+
   // Network and lifecycle events
   window.addEventListener("online", () => {
     checkHeartbeat();
@@ -1454,4 +1470,91 @@ function init() {
   }
 }
 
+/* ---------------- Pull-to-refresh ---------------- */
+function setupPullToRefresh() {
+  const indicator = $("#ptr-indicator");
+  const icon = indicator ? indicator.querySelector(".ptr-icon") : null;
+  const text = indicator ? indicator.querySelector(".ptr-text") : null;
+  if (!indicator) return;
+
+  let startY = 0;
+  let currentY = 0;
+  let isTracking = false;
+  let isRefreshing = false;
+  const threshold = 65; // px of pull to trigger refresh
+
+  function isEligible() {
+    // Only allow pull-to-refresh when at the top of the page
+    return window.scrollY <= 2 && document.documentElement.scrollTop <= 2;
+  }
+
+  window.addEventListener("touchstart", (e) => {
+    if (isRefreshing) return;
+    if (isEligible()) {
+      startY = e.touches[0].clientY;
+      currentY = startY;
+      isTracking = true;
+    }
+  }, { passive: true });
+
+  window.addEventListener("touchmove", (e) => {
+    if (!isTracking || isRefreshing) return;
+    currentY = e.touches[0].clientY;
+    const diff = currentY - startY;
+
+    if (diff > 0 && isEligible()) {
+      indicator.classList.add("pulling");
+      // Damped pull distance
+      const pullDist = Math.min(diff * 0.45, 80);
+      indicator.style.height = `${pullDist}px`;
+
+      if (pullDist >= threshold * 0.45) {
+        indicator.classList.add("ready");
+        if (text) text.textContent = "Release to refresh…";
+      } else {
+        indicator.classList.remove("ready");
+        if (text) text.textContent = "Pull to refresh…";
+      }
+    } else {
+      indicator.classList.remove("pulling", "ready");
+      indicator.style.height = "0px";
+    }
+  }, { passive: true });
+
+  window.addEventListener("touchend", async () => {
+    if (!isTracking || isRefreshing) return;
+    isTracking = false;
+    const diff = currentY - startY;
+    const pullDist = diff * 0.45;
+
+    if (pullDist >= threshold * 0.45 && isEligible()) {
+      isRefreshing = true;
+      indicator.classList.remove("pulling", "ready");
+      indicator.classList.add("refreshing");
+      indicator.style.height = "44px";
+      if (text) text.textContent = "Refreshing…";
+
+      const headerBtn = $("#header-refresh-btn");
+      if (headerBtn) headerBtn.classList.add("spinning");
+
+      try {
+        await refreshAll(false);
+        toast("Refreshed! ✅");
+      } catch (e) {
+        console.warn("Pull-to-refresh error:", e);
+      } finally {
+        isRefreshing = false;
+        indicator.classList.remove("refreshing");
+        indicator.style.height = "0px";
+        if (headerBtn) headerBtn.classList.remove("spinning");
+        if (text) text.textContent = "Pull to refresh…";
+      }
+    } else {
+      indicator.classList.remove("pulling", "ready");
+      indicator.style.height = "0px";
+    }
+  }, { passive: true });
+}
+
 document.addEventListener("DOMContentLoaded", init);
+
