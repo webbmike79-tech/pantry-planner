@@ -58,6 +58,8 @@ function getOrCreateElement(id) {
       dataset: {},
       children: [],
       addEventListener() {},
+      setAttribute(attr, val) { this[attr] = val; },
+      removeAttribute(attr) { delete this[attr]; },
       appendChild(child) { this.children.push(child); },
       removeChild(child) {
         const idx = this.children.indexOf(child);
@@ -1134,6 +1136,81 @@ async function runTests() {
   assert.ok(satCardHtml.includes("Serves: 4"), "Pre-feature card renders cleanly with Serves: 4");
 
   console.log("✓ Test 19 Passed: Per-day servings (day card stepper, custom indicator, reset link, rounding/scaling, mid-week sync, migration)");
+  passed++;
+
+  // Test 20: Unconditional photo & receipt discard
+  console.log("\nRunning Test 20: Photo & receipt discard (URL revoke, input clear, preview cleanup, zero image in storage)...");
+
+  let revokedUrls = [];
+  const origRevoke = URL.revokeObjectURL;
+  URL.revokeObjectURL = (url) => {
+    revokedUrls.push(url);
+    if (typeof origRevoke === "function") {
+      try { origRevoke(url); } catch (e) {}
+    }
+  };
+
+  const mockFile = new Blob(["fake shelf photo content"], { type: "image/jpeg" });
+  mockFile.name = "fridge_shelf.jpg";
+  const scanInput = getOrCreateElement("scan-file");
+  const scanName = getOrCreateElement("scan-file-name");
+  const scanPreview = getOrCreateElement("scan-preview");
+  const scanWrapper = getOrCreateElement("scan-preview-wrapper");
+  const scanBtn = getOrCreateElement("scan-btn");
+
+  scanInput.value = "C:\\fakepath\\fridge_shelf.jpg";
+  applyChosenPhotos("scan", [mockFile], scanName, scanPreview, scanBtn);
+
+  assert.ok(scanPreview.src.startsWith("blob:"), "Preview src assigned blob object URL");
+  assert.strictEqual(scanPreview.hidden, false, "Preview visible after photo pick");
+  assert.strictEqual(scanBtn.disabled, false, "Scan button enabled after photo pick");
+  assert.strictEqual(scanName.textContent, "fridge_shelf.jpg", "Photo name displayed");
+
+  const createdUrl = scanPreview.src;
+
+  // Test explicit discard
+  discardScanImage("scan");
+
+  assert.ok(revokedUrls.includes(createdUrl), "Object URL was revoked via URL.revokeObjectURL");
+  assert.strictEqual(scanPreview.hidden, true, "Preview hidden after discard");
+  assert.strictEqual(scanPreview.src, "", "Preview src cleared after discard");
+  assert.strictEqual(scanInput.value, "", "File input cleared after discard");
+  assert.strictEqual(scanName.textContent, "No photo chosen yet", "File name reset to empty label");
+  assert.strictEqual(scanBtn.disabled, true, "Scan button disabled after discard");
+  assert.strictEqual(selectedPhotoFiles.scan, null, "selectedPhotoFiles reference wiped");
+
+  // Test receipt discard
+  const receiptFile = new Blob(["fake receipt photo content"], { type: "image/jpeg" });
+  receiptFile.name = "heb_receipt.jpg";
+  const receiptInput = getOrCreateElement("receipt-file");
+  const receiptName = getOrCreateElement("receipt-file-name");
+  const receiptPreview = getOrCreateElement("receipt-preview");
+  const receiptWrapper = getOrCreateElement("receipt-preview-wrapper");
+  const receiptBtn = getOrCreateElement("receipt-btn");
+
+  receiptInput.value = "C:\\fakepath\\heb_receipt.jpg";
+  applyChosenPhotos("receipt", [receiptFile], receiptName, receiptPreview, receiptBtn);
+  const receiptBlobUrl = receiptPreview.src;
+  assert.ok(receiptBlobUrl.startsWith("blob:"), "Receipt preview assigned blob URL");
+
+  discardScanImage("receipt");
+
+  assert.ok(revokedUrls.includes(receiptBlobUrl), "Receipt object URL revoked");
+  assert.strictEqual(receiptPreview.hidden, true, "Receipt preview hidden");
+  assert.strictEqual(receiptPreview.src, "", "Receipt preview src cleared");
+  assert.strictEqual(receiptInput.value, "", "Receipt file input cleared");
+  assert.strictEqual(receiptName.textContent, "No photos chosen yet", "Receipt file name reset");
+  assert.strictEqual(receiptBtn.disabled, true, "Receipt scan button disabled");
+  assert.strictEqual(selectedPhotoFiles.receipt, null, "Receipt selectedPhotoFiles wiped");
+
+  // Verify localStorage contains zero image / base64 data
+  for (const key of Object.keys(localStorage.store)) {
+    const val = localStorage.getItem(key);
+    assert.ok(!val.includes("data:image/"), `localStorage key '${key}' must not contain data URLs`);
+    assert.ok(!val.includes("base64,"), `localStorage key '${key}' must not contain base64 payloads`);
+  }
+
+  console.log("✓ Test 20 Passed: Photo & receipt discard (object URL revoked, input cleared, preview cleared, localStorage clean)");
   passed++;
 
   console.log(`\nAll ${passed} Mobile Client tests passed successfully!`);
