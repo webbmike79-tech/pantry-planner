@@ -61,21 +61,33 @@ function getOrCreateElement(id) {
       scrollIntoView() {},
       focus() {},
       querySelector(s) {
-        if (s.startsWith(".")) {
-          const cls = s.slice(1);
-          for (const ch of this.children) {
-            if (ch.innerHTML && ch.innerHTML.includes(cls)) return ch;
+        const matches = this.querySelectorAll(s);
+        return matches.length ? matches[0] : getOrCreateElement("child_" + s);
+      },
+      querySelectorAll(s) {
+        const out = [];
+        const cleanCls = s.replace(/^\./, "");
+        function search(node) {
+          if (node.children) {
+            for (const ch of node.children) {
+              if (s.startsWith(".") && ch.className && ch.className.split(" ").includes(cleanCls)) {
+                out.push(ch);
+              }
+              search(ch);
+            }
           }
         }
-        return getOrCreateElement("child_" + s);
+        search(this);
+        return out;
       },
-      querySelectorAll() { return []; },
     };
     Object.defineProperty(el, "innerHTML", {
       get() { return this._innerHTML; },
       set(val) {
         this._innerHTML = val;
-        if (val === "") this.children = [];
+        if (val === "") {
+          this.children = [];
+        }
       }
     });
     domElements[id] = el;
@@ -88,21 +100,62 @@ global.document = {
     if (sel.startsWith("#")) {
       return getOrCreateElement(sel.slice(1));
     }
-    const wrap = getOrCreateElement("menu-days");
-    if (wrap && wrap.children) {
+    const wrap = domElements["menu-days"];
+    if (wrap && wrap.children && (sel === ".meal-header" || sel === ".changed-note")) {
       for (const card of wrap.children) {
+        if (sel === ".changed-note") {
+          const m = (card.innerHTML || "").match(/<div class="changed-note">([\s\S]*?)<\/div>/);
+          return {
+            innerHTML: m ? m[0] : "",
+            textContent: m ? m[1] : "",
+          };
+        }
         if (card.innerHTML && card.innerHTML.includes(sel.replace(".", ""))) {
-          return card;
+          return {
+            innerHTML: card.innerHTML,
+            textContent: card.innerHTML,
+            querySelectorAll() { return []; }
+          };
         }
       }
     }
+    const all = this.querySelectorAll(sel);
+    if (all.length) return all[0];
     return getOrCreateElement("mock_" + sel.replace(/[^a-zA-Z0-9]/g, "_"));
   },
-  querySelectorAll() {
-    return [];
+  querySelectorAll(sel) {
+    const onHand = domElements["on-hand-groups"];
+    if (onHand && (sel === ".onhand-group" || sel.startsWith(".onhand-group["))) {
+      const results = [];
+      for (const ch of (onHand.children || [])) {
+        if (sel.includes("[data-location=")) {
+          const m = sel.match(/\[data-location="([^"]+)"\]/);
+          if (m && ch.dataset && ch.dataset.location === m[1]) results.push(ch);
+        } else {
+          results.push(ch);
+        }
+      }
+      return results;
+    }
+    const results = [];
+    const cleanSel = sel.replace(/^\./, "");
+    for (const key of Object.keys(domElements)) {
+      const el = domElements[key];
+      if (sel.startsWith(".") && el.className && el.className.split(" ").includes(cleanSel)) {
+        results.push(el);
+      } else if (sel.includes("[data-location=")) {
+        const m = sel.match(/\[data-location="([^"]+)"\]/);
+        if (m && el.dataset && el.dataset.location === m[1]) {
+          results.push(el);
+        }
+      }
+    }
+    return results;
   },
   createElement(tag) {
-    return getOrCreateElement("tag_" + tag + "_" + Math.random());
+    const el = getOrCreateElement("tag_" + tag + "_" + Math.random());
+    el.tagName = tag.toUpperCase();
+    return el;
   },
   addEventListener() {},
   visibilityState: "visible"
@@ -376,6 +429,47 @@ async function runTests() {
   console.log("✓ Test 12 Passed: Pull-to-refresh indicator and header refresh controls present");
   passed++;
 
+  // Test 13: Dedicated "On Hand" inventory view
+  state.inventory = [
+    { id: 1, item_name: "Zucchini", quantity: 2, unit: "count", location: "Fridge", category: "Produce/Veggies" },
+    { id: 2, item_name: "Apples", quantity: 4, unit: "count", location: "Fridge", category: "Produce/Veggies" },
+    { id: 3, item_name: "Frozen Peas", quantity: 0, unit: "bags", location: "Freezer", category: "Frozen" },
+    { id: 4, item_name: "Brown Rice", quantity: 1, unit: "bag", location: "Cupboard / Pantry", category: "Pantry/Dry" },
+  ];
+  renderInventory();
+
+  // (a) Check grouping by Fridge, Freezer, Cupboard / Pantry
+  // (a) Check grouping by Fridge, Freezer, Cupboard / Pantry
+  const groups = document.querySelectorAll(".onhand-group");
+  assert.strictEqual(groups.length, 3, "Three on-hand groups render for 3 distinct locations");
+
+  // (b) Check alphabetical order inside Fridge: Apples (A) before Zucchini (Z)
+  const fridgeGroup = document.querySelector('.onhand-group[data-location="Fridge"]');
+  assert.ok(fridgeGroup, "Fridge group exists");
+  const listDiv = fridgeGroup.children.find((c) => c.className === "onhand-list");
+  assert.ok(listDiv, "Fridge list container exists");
+  assert.ok(listDiv.children[0].innerHTML.includes("Apples"), "First fridge item is Apples (alphabetical)");
+  assert.ok(listDiv.children[1].innerHTML.includes("Zucchini"), "Second fridge item is Zucchini (alphabetical)");
+
+  // (c) Check 0 quantity displays as "out"
+  const freezerGroup = document.querySelector('.onhand-group[data-location="Freezer"]');
+  assert.ok(freezerGroup, "Freezer group exists");
+  const freezerList = freezerGroup.children.find((c) => c.className === "onhand-list");
+  assert.ok(freezerList, "Freezer list container exists");
+  assert.ok(freezerList.children[0].innerHTML.includes('class="onhand-qty out">out<'), "0 quantity renders with out class and 'out' text");
+
+  // (d) Mode toggling & jumpToInventoryEditor
+  setInventoryViewMode("onhand");
+  assert.strictEqual(document.querySelector("#on-hand-container").hidden, false);
+  assert.strictEqual(document.querySelector("#inventory-editor-card").hidden, true);
+
+  jumpToInventoryEditor("Apples");
+  assert.strictEqual(document.querySelector("#on-hand-container").hidden, true);
+  assert.strictEqual(document.querySelector("#inventory-editor-card").hidden, false);
+
+  console.log("✓ Test 13 Passed: Dedicated On Hand view (Fridge/Freezer/Pantry grouping, alphabetical, 'out' badge, jump-to-editor)");
+  passed++;
+
   console.log(`\nAll ${passed} Mobile Client tests passed successfully!`);
 }
 
@@ -383,4 +477,5 @@ runTests().catch((err) => {
   console.error("Test failed:", err);
   process.exit(1);
 });
+
 
