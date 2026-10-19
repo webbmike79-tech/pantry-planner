@@ -57,8 +57,21 @@ function getOrCreateElement(id) {
       disabled: false,
       dataset: {},
       children: [],
-      addEventListener() {},
+      addEventListener(evt, fn) {
+        if (!this._listeners) this._listeners = {};
+        if (!this._listeners[evt]) this._listeners[evt] = [];
+        this._listeners[evt].push(fn);
+        if (evt === "click") this.onclick = fn;
+      },
+      click() {
+        if (this.onclick) this.onclick({ preventDefault() {} });
+        if (this._listeners && this._listeners["click"]) {
+          for (const fn of this._listeners["click"]) fn({ preventDefault() {} });
+        }
+      },
       setAttribute(attr, val) { this[attr] = val; },
+      getAttribute(attr) { return this[attr] !== undefined ? this[attr] : null; },
+      hasAttribute(attr) { return this[attr] !== undefined; },
       removeAttribute(attr) { delete this[attr]; },
       appendChild(child) { this.children.push(child); },
       removeChild(child) {
@@ -76,6 +89,7 @@ function getOrCreateElement(id) {
       },
       scrollIntoView() {},
       focus() {},
+      closest() { return this; },
       querySelector(s) {
         const matches = this.querySelectorAll(s);
         return matches.length ? matches[0] : getOrCreateElement("child_" + s);
@@ -176,7 +190,11 @@ global.document = {
     el.tagName = tag.toUpperCase();
     return el;
   },
-  addEventListener() {},
+  addEventListener(evt, fn) {
+    if (!this._listeners) this._listeners = {};
+    if (!this._listeners[evt]) this._listeners[evt] = [];
+    this._listeners[evt].push(fn);
+  },
   visibilityState: "visible"
 };
 
@@ -1398,6 +1416,173 @@ async function runTests() {
   assert.strictEqual(receiptBtnEl.disabled, true, "Receipt button disabled after discard on error");
 
   console.log("✓ Test 21 Passed: Progress states for slow AI actions (generate and scans, elapsed counting, resolve & reject)");
+  passed++;
+
+  // Test 22: Server setup reachability and key-prompt trap fix (Requirements R1, R2, R3)
+  console.log("\nRunning Test 22: Server setup reachability and key-prompt trap fix...");
+
+  // Initialize event listeners
+  init();
+
+  const setupScreenEl = document.querySelector("#setup-screen");
+  const serverSetupScreenEl = document.querySelector("#server-setup-screen");
+  const setupToServerBtnEl = document.querySelector("#setup-to-server-btn");
+  const unreachableModalEl = document.querySelector("#server-unreachable-modal");
+  const unreachableTextEl = document.querySelector("#server-unreachable-text");
+  const unreachableEditBtnEl = document.querySelector("#server-unreachable-edit-btn");
+  const unreachableRetryBtnEl = document.querySelector("#server-unreachable-retry-btn");
+  const unreachableCloseBtnEl = document.querySelector("#server-unreachable-close-btn");
+  const setupServerCloseBtnEl = document.querySelector("#setup-server-close-btn");
+  const headerServerBtnEl = document.querySelector("#header-server-btn");
+  const bannerSettingsBtnEl = document.querySelector("#banner-settings-btn");
+
+  // Verify HTML markup has escape button and unreachable modal
+  const staticHtml = fs.readFileSync(path.resolve(__dirname, "../api/static/index.html"), "utf-8");
+  assert.ok(staticHtml.includes('id="setup-to-server-btn"'), "setup-to-server-btn exists in HTML markup");
+  assert.ok(staticHtml.includes('id="server-unreachable-modal"'), "server-unreachable-modal exists in HTML markup");
+  assert.ok(staticHtml.includes('id="header-server-btn"'), "header-server-btn exists in HTML markup");
+  assert.ok(staticHtml.includes('id="setup-server-close-btn"'), "setup-server-close-btn exists in HTML markup");
+
+  // 1. (a) Key-prompt screen exposes the server-setup escape and it opens the connection page
+  localStorage.clear();
+  sessionStorage.clear();
+  setHostedDefaultServerUrl("");
+  setConnectionState("DISCONNECTED");
+
+  showSetup();
+  assert.strictEqual(setupScreenEl.hidden, false, "Key prompt screen is visible");
+  assert.strictEqual(serverSetupScreenEl.hidden, true, "Server setup is hidden initially");
+
+  // Click the escape button from key prompt screen
+  setupToServerBtnEl.click();
+  assert.strictEqual(setupScreenEl.hidden, true, "Key prompt screen is hidden after clicking server escape");
+  assert.strictEqual(serverSetupScreenEl.hidden, false, "Server connection page is opened after clicking server escape");
+  hideServerSetup();
+  assert.strictEqual(serverSetupScreenEl.hidden, true, "Server setup hidden after close");
+
+  // 2. (b) With server URL stored, no AI action renders a key prompt even when server is unreachable;
+  //        the server-unreachable state with edit-address button renders instead.
+  localStorage.clear();
+  sessionStorage.clear();
+  localStorage.setItem(SERVER_URL_STORAGE, "http://192.168.4.162:8001");
+  setConnectionState("DISCONNECTED");
+
+  assert.strictEqual(hasServerConfigured(), true, "hasServerConfigured returns true when server URL is stored");
+  assert.strictEqual(isOnline(), false, "isOnline returns false when disconnected");
+
+  // Calling requireKey while disconnected with server stored must NOT show setup-screen
+  setupScreenEl.hidden = true;
+  unreachableModalEl.hidden = true;
+  const canProceed = requireKey();
+  assert.strictEqual(canProceed, false, "requireKey returns false when offline");
+  assert.strictEqual(setupScreenEl.hidden, true, "Key prompt screen is NEVER shown when server URL is configured");
+  assert.strictEqual(unreachableModalEl.hidden, false, "Server unreachable modal is shown instead");
+  assert.ok(unreachableTextEl.textContent.includes("192.168.4.162:8001"), "Unreachable modal contains stored server address");
+  assert.ok(unreachableTextEl.textContent.includes("can't be reached"), "Unreachable modal contains plain-language explanation");
+
+  // Clicking "Edit Server Address" button from unreachable modal opens server setup
+  unreachableEditBtnEl.click();
+  assert.strictEqual(unreachableModalEl.hidden, true, "Unreachable modal hidden on edit click");
+  assert.strictEqual(serverSetupScreenEl.hidden, false, "Server setup screen opened from unreachable modal");
+  const setupUrlInput = document.querySelector("#setup-server-url");
+  assert.strictEqual(setupUrlInput.value, "http://192.168.4.162:8001", "Server setup input pre-populated with stored address");
+  hideServerSetup();
+
+  // Test generatePlan() while unreachable with server stored
+  setupScreenEl.hidden = true;
+  unreachableModalEl.hidden = true;
+  await generatePlan();
+  assert.strictEqual(setupScreenEl.hidden, true, "generatePlan NEVER shows key prompt when server configured");
+  assert.strictEqual(unreachableModalEl.hidden, false, "generatePlan displays unreachable modal when disconnected");
+  hideServerUnreachableModal();
+
+  // Test scanShelfPhoto() while unreachable with server stored
+  const mockShelfFile = new Blob(["shelf photo"], { type: "image/jpeg" });
+  mockShelfFile.name = "shelf.jpg";
+  applyChosenPhotos("scan", [mockShelfFile], document.querySelector("#scan-file-name"), document.querySelector("#scan-preview"), document.querySelector("#scan-btn"));
+  setupScreenEl.hidden = true;
+  unreachableModalEl.hidden = true;
+  await scanShelfPhoto();
+  assert.strictEqual(setupScreenEl.hidden, true, "scanShelfPhoto NEVER shows key prompt when server configured");
+  assert.strictEqual(unreachableModalEl.hidden, false, "scanShelfPhoto displays unreachable modal when disconnected");
+  hideServerUnreachableModal();
+
+  // Test scanReceipt() while unreachable with server stored
+  const mockReceiptFile = new Blob(["receipt photo"], { type: "image/jpeg" });
+  mockReceiptFile.name = "receipt.jpg";
+  applyChosenPhotos("receipt", [mockReceiptFile], document.querySelector("#receipt-file-name"), document.querySelector("#receipt-preview"), document.querySelector("#receipt-btn"));
+  setupScreenEl.hidden = true;
+  unreachableModalEl.hidden = true;
+  await scanReceipt();
+  assert.strictEqual(setupScreenEl.hidden, true, "scanReceipt NEVER shows key prompt when server configured");
+  assert.strictEqual(unreachableModalEl.hidden, false, "scanReceipt displays unreachable modal when disconnected");
+  hideServerUnreachableModal();
+
+  // 3. (c) From the connected main UI, server setup can be opened and stored address changed
+  setConnectionState("CONNECTED");
+  updateConnectionUI();
+
+  const headerDotEl = document.querySelector("#header-server-dot");
+  const headerLabelEl = document.querySelector("#header-server-label");
+  assert.strictEqual(headerDotEl.classList.contains("connected"), true, "Header server dot shows connected state");
+  assert.strictEqual(headerLabelEl.textContent, "Connected", "Header server label shows 'Connected'");
+
+  // Open server setup via header button
+  serverSetupScreenEl.hidden = true;
+  headerServerBtnEl.click();
+  assert.strictEqual(serverSetupScreenEl.hidden, false, "Server setup opened from header button in main UI");
+
+  // Cancel / close button closes modal without saving
+  setupServerCloseBtnEl.click();
+  assert.strictEqual(serverSetupScreenEl.hidden, true, "Cancel button closes server setup screen");
+
+  // Re-open and change address to new hub IP
+  headerServerBtnEl.click();
+  assert.strictEqual(serverSetupScreenEl.hidden, false, "Server setup re-opened from header");
+  setupUrlInput.value = "http://192.168.1.9:8001";
+
+  fetchHandler = async (url) => {
+    if (url.includes("192.168.1.9:8001/health")) {
+      return {
+        ok: true,
+        status: 200,
+        headers: { get: () => "application/json" },
+        json: async () => ({ ok: true, status: "ok", app: "pantry-planner" })
+      };
+    }
+    return { ok: true, status: 200, headers: { get: () => "application/json" }, json: async () => ({}) };
+  };
+
+  const setupTestBtn = document.querySelector("#setup-server-test-btn");
+  await setupTestBtn.onclick();
+  await new Promise((r) => setTimeout(r, 700));
+
+  assert.strictEqual(storedServerUrl(), "http://192.168.1.9:8001", "Stored server URL updated to new IP");
+  assert.strictEqual(localStorage.getItem(SERVER_URL_STORAGE), "http://192.168.1.9:8001", "New server URL persisted in localStorage");
+  assert.strictEqual(serverSetupScreenEl.hidden, true, "Server setup closed after successful connect");
+
+  // Also verify banner Settings button opens server setup when disconnected
+  setConnectionState("DISCONNECTED");
+  updateConnectionUI();
+  serverSetupScreenEl.hidden = true;
+  bannerSettingsBtnEl.click();
+  assert.strictEqual(serverSetupScreenEl.hidden, false, "Server setup opened from connection banner Settings button");
+  hideServerSetup();
+
+  // 4. (d) Regression: Standalone mode with NO server stored still offers original key flow unchanged
+  localStorage.clear();
+  sessionStorage.clear();
+  setHostedDefaultServerUrl("");
+  setConnectionState("DISCONNECTED");
+
+  assert.strictEqual(hasServerConfigured(), false, "hasServerConfigured is false in standalone mode");
+  setupScreenEl.hidden = true;
+  const standaloneCheck = requireKey();
+  assert.strictEqual(standaloneCheck, false, "requireKey returns false when standalone has no key");
+  assert.strictEqual(setupScreenEl.hidden, false, "Original key prompt shown when in standalone mode with no keys");
+  hideSetup();
+
+  console.log("✓ Test 22 Passed: Server setup reachability and key-prompt trap fix (escape door, unreachable modal, header access, address update, standalone regression)");
   passed++;
 
   console.log(`\nAll ${passed} Mobile Client tests passed successfully!`);
