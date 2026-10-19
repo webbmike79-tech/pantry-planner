@@ -45,6 +45,10 @@ from api.ai_fallback import (
     generate_structured_with_fallback,
     validate_provider_key,
 )
+from api.religious_diet import (
+    check_meal_violation,
+    build_religious_diet_prompt_section,
+)
 
 # ==========================================
 # PATHS
@@ -259,10 +263,15 @@ def init_db():
             base_headcount INTEGER,
             dietary_tags TEXT,
             custom_diet_notes TEXT,
-            essential_staples TEXT
+            essential_staples TEXT,
+            religious_presets TEXT DEFAULT '[]'
         )
     """
     )
+    try:
+        c.execute("ALTER TABLE settings ADD COLUMN religious_presets TEXT DEFAULT '[]'")
+    except Exception:
+        pass
     c.execute(
         """
         CREATE TABLE IF NOT EXISTS saved_plans (
@@ -280,8 +289,8 @@ def init_db():
         )
         c.execute(
             """
-            INSERT INTO settings (id, base_headcount, dietary_tags, custom_diet_notes, essential_staples)
-            VALUES (1, 2, ?, 'Provide wholesome meals tailored to any household restrictions entered below.', ?)
+            INSERT INTO settings (id, base_headcount, dietary_tags, custom_diet_notes, essential_staples, religious_presets)
+            VALUES (1, 2, ?, 'Provide wholesome meals tailored to any household restrictions entered below.', ?, '[]')
         """,
             (default_tags, default_staples),
         )
@@ -716,30 +725,62 @@ def process_scanned_receipt_items(
 def get_settings():
     conn = sqlite3.connect(get_db_file())
     c = conn.cursor()
-    c.execute(
-        "SELECT base_headcount, dietary_tags, custom_diet_notes, essential_staples FROM settings WHERE id = 1"
-    )
-    row = c.fetchone()
+    try:
+        c.execute(
+            "SELECT base_headcount, dietary_tags, custom_diet_notes, essential_staples, religious_presets FROM settings WHERE id = 1"
+        )
+        row = c.fetchone()
+    except Exception:
+        c.execute(
+            "SELECT base_headcount, dietary_tags, custom_diet_notes, essential_staples FROM settings WHERE id = 1"
+        )
+        row = c.fetchone()
     conn.close()
+    if not row:
+        return {
+            "base_headcount": 2,
+            "dietary_tags": ["Balanced & Whole Foods"],
+            "custom_diet_notes": "",
+            "essential_staples": "",
+            "religious_presets": [],
+        }
+    r_presets = []
+    if len(row) > 4 and row[4]:
+        try:
+            r_presets = json.loads(row[4]) if isinstance(row[4], str) else row[4]
+        except Exception:
+            r_presets = []
     return {
         "base_headcount": row[0],
-        "dietary_tags": json.loads(row[1]),
+        "dietary_tags": json.loads(row[1]) if isinstance(row[1], str) else row[1],
         "custom_diet_notes": row[2],
         "essential_staples": row[3],
+        "religious_presets": r_presets,
     }
 
 
-def save_settings(base_headcount: int, dietary_tags: list, custom_notes: str, staples: str):
+def save_settings(base_headcount: int, dietary_tags: list, custom_notes: str, staples: str, religious_presets: Optional[list] = None):
     conn = sqlite3.connect(get_db_file())
     c = conn.cursor()
-    c.execute(
-        """
-        UPDATE settings
-        SET base_headcount = ?, dietary_tags = ?, custom_diet_notes = ?, essential_staples = ?
-        WHERE id = 1
-    """,
-        (base_headcount, json.dumps(dietary_tags), custom_notes, staples),
-    )
+    presets_json = json.dumps(religious_presets if religious_presets is not None else [])
+    try:
+        c.execute(
+            """
+            UPDATE settings
+            SET base_headcount = ?, dietary_tags = ?, custom_diet_notes = ?, essential_staples = ?, religious_presets = ?
+            WHERE id = 1
+        """,
+            (base_headcount, json.dumps(dietary_tags), custom_notes, staples, presets_json),
+        )
+    except Exception:
+        c.execute(
+            """
+            UPDATE settings
+            SET base_headcount = ?, dietary_tags = ?, custom_diet_notes = ?, essential_staples = ?
+            WHERE id = 1
+        """,
+            (base_headcount, json.dumps(dietary_tags), custom_notes, staples),
+        )
     conn.commit()
     conn.close()
 
@@ -942,6 +983,9 @@ def generate_weekly_menu_and_list(
             ["id", "location", "item_name", "category", "quantity", "unit"]
         ].to_dict(orient="records")
 
+    rel_presets = settings.get("religious_presets", [])
+    rel_section = build_religious_diet_prompt_section(rel_presets)
+
     prompt = f"""
     Build a practical, delicious 7-day meal plan and a consolidated shopping list.
     Current Season/Holiday Context: {active_theme}
@@ -956,8 +1000,10 @@ def generate_weekly_menu_and_list(
     - Selected Tags/Diets: {", ".join(settings["dietary_tags"])}
     - Specific Household Rules & Allergies: {settings["custom_diet_notes"]}
 
+    {rel_section}
+
     DIETARY ENFORCEMENT RULES FOR THE AI:
-    1. STRICTLY OBEY all dietary tags, medical restrictions, and food allergies specified by the household above. Avoid all allergens and restricted ingredients completely across every meal.
+    1. STRICTLY OBEY all dietary tags, medical restrictions, religious presets, and food allergies specified by the household above. Avoid all allergens and restricted ingredients completely across every meal.
     2. Provide clear step-by-step preparation instructions for breakfast, lunch, and dinner, including timings and recommendations for countertop appliances (like an air fryer or stovetop/oven).
 
     INSTRUCTIONS:
@@ -985,6 +1031,9 @@ def swap_single_meal(
     
     Routes through the Milestone 5 provider fallback chain.
     """
+    rel_presets = settings.get("religious_presets", [])
+    rel_section = build_religious_diet_prompt_section(rel_presets)
+
     prompt = f"""
     You are swapping out a single meal for {target_slot.upper()}.
     
@@ -998,7 +1047,8 @@ def swap_single_meal(
     4. Household Dietary Rules (STRICT ENFORCEMENT):
        - Selected Tags/Diets: {", ".join(settings["dietary_tags"])}
        - Specific Household Rules & Allergies: {settings["custom_diet_notes"]}
-       The replacement must strictly comply with all dietary tags and allergies.
+       {rel_section}
+       The replacement must strictly comply with all dietary tags, religious presets, and allergies.
     5. Scale portion sizes accurately for a headcount of {headcount} people.
     6. For each ingredient in `ingredients_used`, reference the exact `inventory_id` (matching the id in AVAILABLE INVENTORY), `item_name`, numeric `amount_used`, and `unit`.
     7. IF NO ON-HAND REPLACEMENT SATISFIES ALL THE RULES: set `found` to False, leave `dish_name` empty, and set `reason_if_not_found` to "Nothing else on hand fits this slot". NEVER invent ingredients or ignore dietary rules.
@@ -1105,6 +1155,7 @@ class SettingsIn(BaseModel):
     dietary_tags: List[str] = []
     custom_diet_notes: str = ""
     essential_staples: str = ""
+    religious_presets: List[str] = []
 
 
 class GeneratePlanRequest(BaseModel):
@@ -1244,7 +1295,13 @@ def api_get_settings():
 
 @app.put("/api/settings")
 def api_save_settings(body: SettingsIn):
-    save_settings(body.base_headcount, body.dietary_tags, body.custom_diet_notes, body.essential_staples)
+    save_settings(
+        body.base_headcount,
+        body.dietary_tags,
+        body.custom_diet_notes,
+        body.essential_staples,
+        religious_presets=body.religious_presets,
+    )
     return get_settings()
 
 
@@ -1302,6 +1359,28 @@ def api_generate_plan(body: GeneratePlanRequest, request: Request):
     )
     plan_dict = plan_output.model_dump()
     base_hc = settings.get("base_headcount", 2)
+    rel_presets = settings.get("religious_presets", [])
+
+    # Deterministic verification of generated plan meals
+    if rel_presets:
+        for day in plan_dict.get("menu", []):
+            day_name = day.get("day", "")
+            for slot in ("breakfast", "lunch", "dinner"):
+                meal = day.get(slot)
+                if meal and isinstance(meal, dict):
+                    ing_names = meal.get("prep_steps", [])
+                    is_violation, reason = check_meal_violation(
+                        dish_name=meal.get("dish_name", ""),
+                        ingredients=ing_names,
+                        active_presets=rel_presets,
+                        day_name=day_name,
+                    )
+                    if is_violation:
+                        raise HTTPException(
+                            status_code=502,
+                            detail=f"Generated plan violated dietary policy: {reason}. Please re-generate."
+                        )
+
     # Part 2 Rule 1 & 4: fresh weekly plan always starts with all 7 days at current household size and no overrides
     for d in plan_dict.get("menu", []):
         d["servings"] = base_hc
@@ -1498,6 +1577,25 @@ def api_swap_meal(body: SwapMealRequest, request: Request):
             "plan": plan,
             "served_by": served_by,
         }
+
+    # Deterministic religious diet preset verification
+    rel_presets = settings.get("religious_presets", [])
+    if rel_presets:
+        used_ing_names = [i.item_name for i in swap_res.ingredients_used] + swap_res.prep_steps
+        is_violation, reason = check_meal_violation(
+            dish_name=swap_res.dish_name,
+            ingredients=used_ing_names,
+            active_presets=rel_presets,
+            day_name=day_obj.get("day", ""),
+        )
+        if is_violation:
+            return {
+                "success": False,
+                "message": f"Swap blocked by dietary policy: {reason}",
+                "plan_id": plan_id,
+                "plan": plan,
+                "served_by": served_by,
+            }
 
     # 5. Apply the replacement to target slot
     new_meal = {
