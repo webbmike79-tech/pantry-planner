@@ -11,3 +11,6 @@ android/build/
 android/local.properties
 android/captures/
 *.apk
+tests/fixtures/vision/*.jpg
+tests/fixtures/vision/*.jpeg
+tests/fixtures/vision/*.png
