@@ -52,7 +52,16 @@ from api.ai_fallback import (
 
 BASE_DIR = Path(__file__).resolve().parent.parent  # project root (holds app.py)
 STATIC_DIR = Path(__file__).resolve().parent / "static"
-DB_FILE = os.environ.get("PANTRY_DB_FILE", str(BASE_DIR / "pantry_planner.db"))
+
+def get_db_file() -> str:
+    path = os.environ.get("PANTRY_DB_FILE")
+    if not path:
+        if os.environ.get("PANTRY_TEST_MODE"):
+            raise RuntimeError("CRITICAL: PANTRY_TEST_MODE is active but PANTRY_DB_FILE is not set! Aborting to protect live database.")
+        path = str(BASE_DIR / "pantry_planner.db")
+    return path
+
+DB_FILE = get_db_file()
 
 # Theme names (from app.py's THEMES). The PWA ships with the current season's
 # palette baked into CSS; the backend only needs the name for the AI prompt.
@@ -228,7 +237,7 @@ class ReceiptScanResult(BaseModel):
 
 
 def init_db():
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(get_db_file())
     c = conn.cursor()
     c.execute(
         """
@@ -281,7 +290,7 @@ def init_db():
 
 
 def add_inventory_items(location: str, items: List[DetectedItem]):
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(get_db_file())
     c = conn.cursor()
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
     for item in items:
@@ -297,7 +306,7 @@ def add_inventory_items(location: str, items: List[DetectedItem]):
 
 
 def get_inventory_df() -> pd.DataFrame:
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(get_db_file())
     df = pd.read_sql_query("SELECT * FROM inventory ORDER BY location, category, item_name", conn)
     conn.close()
     return df
@@ -305,7 +314,7 @@ def get_inventory_df() -> pd.DataFrame:
 
 def get_inventory() -> List[dict]:
     """Inventory as a list of plain dicts (JSON-friendly types)."""
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(get_db_file())
     conn.row_factory = sqlite3.Row
     rows = conn.execute(
         "SELECT * FROM inventory ORDER BY location, category, item_name"
@@ -326,7 +335,7 @@ def get_inventory() -> List[dict]:
 
 
 def clear_inventory():
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(get_db_file())
     conn.execute("DELETE FROM inventory")
     conn.commit()
     conn.close()
@@ -338,7 +347,7 @@ def replace_inventory_from_df(df: pd.DataFrame):
     # save renumbered the inventory and broke the inventory_id references
     # stored in saved meal plans. Rows carrying a valid existing id keep it;
     # brand-new rows (id empty/NaN) get a fresh id.
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(get_db_file())
     c = conn.cursor()
     c.execute("DELETE FROM inventory")
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -474,7 +483,7 @@ def scale_day_ingredients_and_shopping(plan: dict, day_name: str, old_servings: 
 
 
 def deduct_day_from_inventory(plan_id: int, day_idx: int) -> List[str]:
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(get_db_file())
     c = conn.cursor()
     c.execute("SELECT plan_json FROM saved_plans WHERE id = ?", (plan_id,))
     row = c.fetchone()
@@ -530,7 +539,7 @@ def deduct_day_from_inventory(plan_id: int, day_idx: int) -> List[str]:
 
 
 def restock_checked_shopping_items(plan_id: int, item_indices: List[int]) -> List[str]:
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(get_db_file())
     c = conn.cursor()
     c.execute("SELECT plan_json FROM saved_plans WHERE id = ?", (plan_id,))
     row = c.fetchone()
@@ -603,7 +612,7 @@ def clear_purchased_shopping_items(plan_id: int) -> int:
 
     Returns the number of items removed. Inventory is not touched.
     """
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(get_db_file())
     c = conn.cursor()
     c.execute("SELECT plan_json FROM saved_plans WHERE id = ?", (plan_id,))
     row = c.fetchone()
@@ -630,7 +639,7 @@ def clear_purchased_shopping_items(plan_id: int) -> int:
 def process_scanned_receipt_items(
     plan_id: Optional[int], receipt_items: List[ReceiptLineItem]
 ) -> List[str]:
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(get_db_file())
     c = conn.cursor()
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
 
@@ -705,7 +714,7 @@ def process_scanned_receipt_items(
 
 
 def get_settings():
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(get_db_file())
     c = conn.cursor()
     c.execute(
         "SELECT base_headcount, dietary_tags, custom_diet_notes, essential_staples FROM settings WHERE id = 1"
@@ -721,7 +730,7 @@ def get_settings():
 
 
 def save_settings(base_headcount: int, dietary_tags: list, custom_notes: str, staples: str):
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(get_db_file())
     c = conn.cursor()
     c.execute(
         """
@@ -751,7 +760,7 @@ def save_settings(base_headcount: int, dietary_tags: list, custom_notes: str, st
                     d["servings_override"] = False
                     changed = True
         if changed:
-            conn = sqlite3.connect(DB_FILE)
+            conn = sqlite3.connect(get_db_file())
             c = conn.cursor()
             c.execute("UPDATE saved_plans SET plan_json = ? WHERE id = ?", (json.dumps(plan), plan_id))
             conn.commit()
@@ -770,7 +779,7 @@ def save_plan(plan_dict: dict):
         if "servings_override" not in d:
             d["servings_override"] = False
 
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(get_db_file())
     c = conn.cursor()
     c.execute(
         "INSERT INTO saved_plans (created_at, plan_json) VALUES (?, ?)",
@@ -783,7 +792,7 @@ def save_plan(plan_dict: dict):
 
 
 def get_latest_plan():
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(get_db_file())
     c = conn.cursor()
     c.execute("SELECT id, created_at, plan_json FROM saved_plans ORDER BY id DESC LIMIT 1")
     row = c.fetchone()
@@ -805,7 +814,7 @@ def get_latest_plan():
 
 
 def update_saved_plan(plan_id: int, plan_dict: dict):
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(get_db_file())
     c = conn.cursor()
     c.execute(
         "UPDATE saved_plans SET plan_json = ? WHERE id = ?",
@@ -817,7 +826,7 @@ def update_saved_plan(plan_id: int, plan_dict: dict):
 
 def clear_saved_plans():
     """Delete all rows from saved_plans, completely clearing the current menu and shopping list."""
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(get_db_file())
     c = conn.cursor()
     c.execute("DELETE FROM saved_plans")
     conn.commit()
@@ -1356,7 +1365,7 @@ def api_update_day_servings(body: DayServingsRequest):
     day_obj["is_overridden"] = is_overridden
     day_obj["servings_override"] = is_overridden
 
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(get_db_file())
     c = conn.cursor()
     c.execute("UPDATE saved_plans SET plan_json = ? WHERE id = ?", (json.dumps(plan), plan_id))
     conn.commit()
