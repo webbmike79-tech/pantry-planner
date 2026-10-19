@@ -1213,6 +1213,193 @@ async function runTests() {
   console.log("✓ Test 20 Passed: Photo & receipt discard (object URL revoked, input cleared, preview cleared, localStorage clean)");
   passed++;
 
+  // Test 21: Progress states for slow AI actions (generate and scans)
+  console.log("\nRunning Test 21: Progress states for slow AI actions (generate and scans)...");
+
+  // 1. startProgressTimer standalone verification
+  const testMsgEl = { textContent: "" };
+  const timer = startProgressTimer(testMsgEl, "Processing task");
+  assert.strictEqual(testMsgEl.textContent, "Processing task (0s)", "Initial timer state at 0s");
+  await new Promise((r) => setTimeout(r, 1100));
+  assert.ok(testMsgEl.textContent.includes("(1s)"), "Timer increments elapsed time to 1s");
+  timer.stop();
+  const stoppedText = testMsgEl.textContent;
+  await new Promise((r) => setTimeout(r, 1100));
+  assert.strictEqual(testMsgEl.textContent, stoppedText, "Timer stopped successfully (no further increment)");
+
+  // Setup connection state for API actions
+  setConnectionState("CONNECTED");
+  localStorage.setItem(KEY_STORAGE, "mock-key");
+
+  // 2. generatePlan() in-flight progress, button disabled, resolve & reject
+  const generateBtn = getOrCreateElement("generate-btn");
+  const menuMsg = getOrCreateElement("menu-msg");
+  generateBtn.disabled = false;
+
+  let resolveGenerate;
+  fetchHandler = (url, opts) => {
+    if (url.includes("/api/plan/generate")) {
+      return new Promise((resolve) => {
+        resolveGenerate = () => resolve({
+          ok: true,
+          status: 200,
+          headers: { get: () => "application/json" },
+          json: async () => ({
+            plan_id: 10,
+            created_at: new Date().toISOString(),
+            plan: { menu: [], shopping_list: [] }
+          })
+        });
+      });
+    }
+    return Promise.resolve({ ok: true, status: 200, headers: { get: () => "application/json" }, json: async () => ({}) });
+  };
+
+  const genP = generatePlan();
+  // While in flight:
+  assert.strictEqual(generateBtn.disabled, true, "Generate button disabled while generating");
+  assert.strictEqual(menuMsg.textContent, "Planning your week… this usually takes about a minute. (0s)", "Generate progress message initialized");
+
+  // Resolve generate
+  resolveGenerate();
+  await genP;
+  assert.strictEqual(generateBtn.disabled, false, "Generate button re-enabled on resolve");
+  assert.strictEqual(menuMsg.textContent, "✅ Weekly Menu & Recipes ready!", "Generate success message shown");
+
+  // Generate on reject / failure
+  fetchHandler = (url, opts) => {
+    if (url.includes("/api/plan/generate")) {
+      return Promise.resolve({
+        ok: false,
+        status: 500,
+        headers: { get: () => "application/json" },
+        json: async () => ({ detail: "AI generation failed: timeout" })
+      });
+    }
+    return Promise.resolve({ ok: true, status: 200, headers: { get: () => "application/json" }, json: async () => ({}) });
+  };
+
+  await generatePlan();
+  assert.strictEqual(generateBtn.disabled, false, "Generate button re-enabled on reject");
+  assert.ok(menuMsg.textContent.includes("AI generation failed"), "Error message displayed on reject");
+
+  // 3. scanShelfPhoto() in-flight progress, button disabled, resolve & reject
+  const scanBtnEl = getOrCreateElement("scan-btn");
+  const scanMsgEl = getOrCreateElement("scan-msg");
+  const scanInputEl = getOrCreateElement("scan-file");
+  const scanNameEl = getOrCreateElement("scan-file-name");
+  const scanPreviewEl = getOrCreateElement("scan-preview");
+
+  const shelfFile = new Blob(["shelf photo"], { type: "image/jpeg" });
+  shelfFile.name = "shelf.jpg";
+  applyChosenPhotos("scan", [shelfFile], scanNameEl, scanPreviewEl, scanBtnEl);
+
+  let resolveScan;
+  fetchHandler = (url, opts) => {
+    if (url.includes("/api/scan-photo")) {
+      return new Promise((resolve) => {
+        resolveScan = () => resolve({
+          ok: true,
+          status: 200,
+          headers: { get: () => "application/json" },
+          json: async () => ({
+            inventory: [],
+            added: 3,
+            served_by: "Gemini"
+          })
+        });
+      });
+    }
+    return Promise.resolve({ ok: true, status: 200, headers: { get: () => "application/json" }, json: async () => ({}) });
+  };
+
+  const scanP = scanShelfPhoto();
+  assert.strictEqual(scanBtnEl.disabled, true, "Scan button disabled while scanning");
+  assert.strictEqual(scanMsgEl.textContent, "Reading your photo… (0s)", "Photo scan progress message initialized");
+
+  resolveScan();
+  await scanP;
+  assert.ok(scanMsgEl.textContent.includes("Added 3 items"), "Scan success message shown");
+  assert.strictEqual(scanBtnEl.disabled, true, "Scan button disabled after discard");
+
+  // Scan shelf photo on reject
+  applyChosenPhotos("scan", [shelfFile], scanNameEl, scanPreviewEl, scanBtnEl);
+  fetchHandler = (url, opts) => {
+    if (url.includes("/api/scan-photo")) {
+      return Promise.resolve({
+        ok: false,
+        status: 500,
+        headers: { get: () => "application/json" },
+        json: async () => ({ detail: "Vision scan error" })
+      });
+    }
+    return Promise.resolve({ ok: true, status: 200, headers: { get: () => "application/json" }, json: async () => ({}) });
+  };
+
+  await scanShelfPhoto();
+  assert.ok(scanMsgEl.textContent.includes("Vision scan error"), "Scan error message shown on reject");
+  assert.strictEqual(scanBtnEl.disabled, true, "Scan button disabled after discard on error");
+
+  // 4. scanReceipt() in-flight progress, button disabled, resolve & reject
+  const receiptBtnEl = getOrCreateElement("receipt-btn");
+  const receiptMsgEl = getOrCreateElement("receipt-msg");
+  const receiptNameEl = getOrCreateElement("receipt-file-name");
+  const receiptPreviewEl = getOrCreateElement("receipt-preview");
+  const receiptFileEl = new Blob(["receipt photo"], { type: "image/jpeg" });
+  receiptFileEl.name = "receipt.jpg";
+  applyChosenPhotos("receipt", [receiptFileEl], receiptNameEl, receiptPreviewEl, receiptBtnEl);
+
+  let resolveReceipt;
+  fetchHandler = (url, opts) => {
+    if (url.includes("/api/receipt/scan")) {
+      return new Promise((resolve) => {
+        resolveReceipt = () => resolve({
+          ok: true,
+          status: 200,
+          headers: { get: () => "application/json" },
+          json: async () => ({
+            inventory: [],
+            plan: null,
+            logs: ["Milk $3.99"],
+            store_name: "HEB",
+            served_by: "Gemini"
+          })
+        });
+      });
+    }
+    return Promise.resolve({ ok: true, status: 200, headers: { get: () => "application/json" }, json: async () => ({}) });
+  };
+
+  const receiptP = scanReceipt();
+  assert.strictEqual(receiptBtnEl.disabled, true, "Receipt button disabled while scanning");
+  assert.strictEqual(receiptMsgEl.textContent, "Reading your receipt… (0s)", "Receipt progress message initialized");
+
+  resolveReceipt();
+  await receiptP;
+  assert.ok(receiptMsgEl.textContent.includes("Restocked 1 items"), "Receipt success message shown");
+  assert.strictEqual(receiptBtnEl.disabled, true, "Receipt button disabled after discard");
+
+  // Receipt on reject
+  applyChosenPhotos("receipt", [receiptFileEl], receiptNameEl, receiptPreviewEl, receiptBtnEl);
+  fetchHandler = (url, opts) => {
+    if (url.includes("/api/receipt/scan")) {
+      return Promise.resolve({
+        ok: false,
+        status: 500,
+        headers: { get: () => "application/json" },
+        json: async () => ({ detail: "Receipt parsing error" })
+      });
+    }
+    return Promise.resolve({ ok: true, status: 200, headers: { get: () => "application/json" }, json: async () => ({}) });
+  };
+
+  await scanReceipt();
+  assert.ok(receiptMsgEl.textContent.includes("Receipt parsing error"), "Receipt error message shown on reject");
+  assert.strictEqual(receiptBtnEl.disabled, true, "Receipt button disabled after discard on error");
+
+  console.log("✓ Test 21 Passed: Progress states for slow AI actions (generate and scans, elapsed counting, resolve & reject)");
+  passed++;
+
   console.log(`\nAll ${passed} Mobile Client tests passed successfully!`);
 }
 
