@@ -2,6 +2,7 @@
 __pycache__/
 *.pyc
 pantry_planner.db
+pantry_providers_status.json
 node_modules/
 .gradle/
 android/.gradle/
