@@ -240,9 +240,18 @@ global.fetch = async (url, opts = {}) => {
 };
 
 const vm = require("vm");
-// Read app.js
-const appJsPath = path.resolve(__dirname, "../api/static/app.js");
+const appJsPath = fs.existsSync(path.resolve(__dirname, "../api/static/app.js"))
+  ? path.resolve(__dirname, "../api/static/app.js")
+  : path.resolve(__dirname, "../static/app.js");
 const appJsCode = fs.readFileSync(appJsPath, "utf-8");
+
+const indexHtmlPath = fs.existsSync(path.resolve(__dirname, "../api/static/index.html"))
+  ? path.resolve(__dirname, "../api/static/index.html")
+  : path.resolve(__dirname, "../static/index.html");
+
+const mealImagesDirPath = fs.existsSync(path.resolve(__dirname, "../api/static/meal-images"))
+  ? path.resolve(__dirname, "../api/static/meal-images")
+  : path.resolve(__dirname, "../static/meal-images");
 
 // Evaluate in global context
 vm.runInThisContext(appJsCode);
@@ -564,7 +573,7 @@ async function runTests() {
   assert.strictEqual(clearBtn.style.display, "inline-block", "Clear menu button is visible when a plan exists");
 
   // 2. Open confirmation modal -> check exact required copy from index.html and element wiring
-  const indexHtml = fs.readFileSync(path.join(__dirname, "../api/static/index.html"), "utf8");
+  const indexHtml = fs.readFileSync(indexHtmlPath, "utf8");
   assert.ok(indexHtml.includes("Start over with a fresh menu?"), "Modal title matches exact required copy");
   assert.ok(
     indexHtml.includes("This clears your current 7-day menu and the shopping list built from it. Your stocked inventory, receipts, and settings stay exactly as they are."),
@@ -721,7 +730,7 @@ async function runTests() {
   assert.strictEqual(shopBtn.style.display, "inline-block", "Shop button shown when items present");
 
   // 5. Transparency / honesty copy verification
-  const rawHtml = fs.readFileSync(path.resolve(__dirname, "../api/static/index.html"), "utf-8");
+  const rawHtml = fs.readFileSync(indexHtmlPath, "utf-8");
   assert.ok(
     rawHtml.includes("Pantry Planner prepares your shopping search links and hands them over to your chosen grocery service. All ordering, fulfillment, and payment happen directly on the store's website or app."),
     "Exact transparency and honesty copy present in shop modal HTML"
@@ -781,7 +790,7 @@ async function runTests() {
   assert.ok(swappedRender.includes('Changed from: <i>Oatmeal with Apples</i>'), "Changed-from note preserved on swapped meal");
 
   // 5. Verify local bundled image set exists on disk and total size is under 500KB
-  const imgDir = path.resolve(__dirname, "../api/static/meal-images");
+  const imgDir = mealImagesDirPath;
   const expectedFiles = [
     "tacos.svg", "pasta.svg", "stir-fry.svg", "roast-chicken.svg",
     "salad.svg", "soup.svg", "breakfast.svg", "seafood.svg",
@@ -1437,7 +1446,7 @@ async function runTests() {
   const bannerSettingsBtnEl = document.querySelector("#banner-settings-btn");
 
   // Verify HTML markup has escape button and unreachable modal
-  const staticHtml = fs.readFileSync(path.resolve(__dirname, "../api/static/index.html"), "utf-8");
+  const staticHtml = fs.readFileSync(indexHtmlPath, "utf-8");
   assert.ok(staticHtml.includes('id="setup-to-server-btn"'), "setup-to-server-btn exists in HTML markup");
   assert.ok(staticHtml.includes('id="server-unreachable-modal"'), "server-unreachable-modal exists in HTML markup");
   assert.ok(staticHtml.includes('id="header-server-btn"'), "header-server-btn exists in HTML markup");
@@ -1584,6 +1593,171 @@ async function runTests() {
 
   console.log("✓ Test 22 Passed: Server setup reachability and key-prompt trap fix (escape door, unreachable modal, header access, address update, standalone regression)");
   passed++;
+
+  // ==========================================
+  // Test 23: Honest errors and connection state hygiene (Part 2)
+  // - simulated scan 503-with-detail → server message displayed, connection state stays CONNECTED, no "offline" wording
+  // - simulated probe transport failure → DISCONNECTED + banner
+  // - successful refresh after a failure → error text cleared
+  // ==========================================
+  {
+    console.log("\nRunning Test 23: Honest errors and connection state hygiene...");
+    localStorage.clear();
+    localStorage.setItem(SERVER_URL_STORAGE, "http://192.168.1.9:8001");
+    setConnectionState("CONNECTED");
+    updateConnectionUI();
+
+    // 1. Simulated scan 503-with-detail
+    const scanMsgEl = document.querySelector("#scan-msg");
+    selectedPhotoFiles.scan = [{ name: "test.jpg", size: 1000, type: "image/jpeg" }];
+
+    fetchHandler = async (url, opts) => {
+      if (url.includes("/api/scan-photo")) {
+        return {
+          ok: false,
+          status: 503,
+          headers: { get: () => "application/json" },
+          json: async () => ({
+            detail: "All AI services are unavailable right now — Gemini, Groq, and OpenRouter were all tried. Please try again in a few minutes."
+          }),
+        };
+      }
+      return { ok: true, status: 200, headers: { get: () => "application/json" }, json: async () => ({}) };
+    };
+
+    await scanShelfPhoto();
+
+    assert.strictEqual(
+      connectionState,
+      "CONNECTED",
+      "simulated scan 503-with-detail: connection state must stay CONNECTED (server was reached)"
+    );
+    assert.ok(
+      scanMsgEl.textContent.includes("All AI services are unavailable right now — Gemini, Groq, and OpenRouter were all tried"),
+      "simulated scan 503-with-detail: server message displayed in status area"
+    );
+    assert.strictEqual(
+      scanMsgEl.textContent.toLowerCase().includes("offline"),
+      false,
+      "simulated scan 503-with-detail: no 'offline' wording when server answers with 503"
+    );
+    assert.strictEqual(
+      scanMsgEl.textContent.toLowerCase().includes("cannot reach server"),
+      false,
+      "simulated scan 503-with-detail: no 'Cannot reach server' wording"
+    );
+
+    // 2. Simulated probe transport failure
+    fetchHandler = async (url) => {
+      if (url.includes("/health")) {
+        throw new Error("Failed to fetch");
+      }
+      return { ok: true, status: 200, headers: { get: () => "application/json" }, json: async () => ({}) };
+    };
+
+    await checkHeartbeat();
+
+    assert.strictEqual(
+      connectionState,
+      "DISCONNECTED",
+      "simulated probe transport failure: probe transport failure sets connectionState to DISCONNECTED"
+    );
+    const bannerEl = document.querySelector("#connection-banner");
+    assert.strictEqual(
+      bannerEl.hidden,
+      false,
+      "simulated probe transport failure: disconnected banner is displayed"
+    );
+    assert.ok(
+      document.querySelector("#banner-text").textContent.includes("Disconnected from"),
+      "simulated probe transport failure: banner text shows disconnected"
+    );
+
+    // 3. Successful refresh after a failure -> error text cleared
+    fetchHandler = async (url) => {
+      if (url.includes("/health")) {
+        return { ok: true, status: 200, headers: { get: () => "application/json" }, json: async () => ({ ok: true, status: "ok", app: "pantry-planner" }) };
+      }
+      if (url.includes("/api/inventory")) return { ok: true, status: 200, headers: { get: () => "application/json" }, json: async () => [] };
+      if (url.includes("/api/settings")) return { ok: true, status: 200, headers: { get: () => "application/json" }, json: async () => ({ base_headcount: 2 }) };
+      if (url.includes("/api/plan/latest")) return { ok: true, status: 200, headers: { get: () => "application/json" }, json: async () => ({ plan_id: null, plan: null }) };
+      return { ok: true, status: 200, headers: { get: () => "application/json" }, json: async () => ({}) };
+    };
+
+    await refreshAll();
+
+    assert.strictEqual(connectionState, "CONNECTED", "successful refresh restores connectionState to CONNECTED");
+    assert.strictEqual(scanMsgEl.textContent, "", "successful refresh after a failure: scan error text cleared");
+    assert.strictEqual(document.querySelector("#menu-msg").textContent, "", "successful refresh after a failure: menu error text cleared");
+
+    console.log("✓ Test 23 Passed: Honest errors and connection state hygiene (scan 503 detail, probe transport failure, error text cleared)");
+    passed++;
+  }
+
+  // ==========================================
+  // Test 24: Offline destructive-op enforcement (Part 3)
+  // - offline save/clear attempt issues zero mutating requests
+  // ==========================================
+  {
+    console.log("\nRunning Test 24: Offline destructive-op enforcement...");
+    setConnectionState("DISCONNECTED");
+    updateConnectionUI();
+
+    const invSaveBtnEl = document.querySelector("#inv-save-btn");
+    const invClearBtnEl = document.querySelector("#inv-clear-btn");
+
+    assert.strictEqual(invSaveBtnEl.disabled, true, "inv-save-btn is disabled while DISCONNECTED");
+    assert.strictEqual(invClearBtnEl.disabled, true, "inv-clear-btn is disabled while DISCONNECTED");
+
+    let mutatingCalls = 0;
+    fetchHandler = async (url, opts) => {
+      const method = (opts && opts.method) || "GET";
+      if (url.includes("/api/inventory") && (method === "PUT" || method === "DELETE")) {
+        mutatingCalls++;
+      }
+      return { ok: true, status: 200, headers: { get: () => "application/json" }, json: async () => ({}) };
+    };
+
+    // Attempt saveInventory()
+    await saveInventory();
+    assert.strictEqual(mutatingCalls, 0, "offline saveInventory issues zero mutating requests");
+
+    // Attempt direct api() calls for PUT and DELETE
+    let putBlocked = false;
+    try {
+      await api("/api/inventory", { method: "PUT", body: [] });
+    } catch (e) {
+      putBlocked = true;
+      assert.ok(e.message.includes("disconnected"), "PUT /api/inventory throws error when disconnected");
+    }
+    assert.strictEqual(putBlocked, true, "PUT /api/inventory was blocked at api() layer");
+
+    let deleteBlocked = false;
+    try {
+      await api("/api/inventory?confirm_clear=true", { method: "DELETE" });
+    } catch (e) {
+      deleteBlocked = true;
+      assert.ok(e.message.includes("disconnected"), "DELETE /api/inventory throws error when disconnected");
+    }
+    assert.strictEqual(deleteBlocked, true, "DELETE /api/inventory was blocked at api() layer");
+    assert.strictEqual(mutatingCalls, 0, "offline save/clear attempt issues zero mutating requests");
+
+    // Hand-adds continue to queue via existing outbox
+    localStorage.removeItem(OUTBOX_STORAGE);
+    queueOfflineAdd({
+      item_name: "Hand Item 1",
+      quantity: 2,
+      unit: "can",
+      location: "Cupboard / Pantry",
+      category: "Pantry/Dry"
+    });
+    const queuedOutbox = getOutbox();
+    assert.strictEqual(queuedOutbox.length, 1, "Hand-adds continue to queue via existing outbox while offline");
+    assert.strictEqual(queuedOutbox[0].item_name, "Hand Item 1", "Queued item has expected name");
+
+    console.log("✓ Test 24 Passed: Offline destructive-op enforcement (control disabled, api layer blocked, outbox queued)");
+    passed++;
+  }
 
   console.log(`\nAll ${passed} Mobile Client tests passed successfully!`);
 }
