@@ -1,5 +1,5 @@
 /* Pantry Planner service worker — cache-first app shell, network-only API. */
-const CACHE = "pantry-planner-v2";
+const CACHE = "pantry-planner-v5";
 const SHELL = [
   "/",
   "/index.html",
@@ -26,8 +26,8 @@ self.addEventListener("activate", (event) => {
 
 self.addEventListener("fetch", (event) => {
   const url = new URL(event.request.url);
-  // API calls always go to the network — pantry data must be live.
-  if (event.request.method !== "GET" || url.pathname.startsWith("/api/")) return;
+  // Cross-origin requests or API calls always go to the network — pantry data must be live.
+  if (url.origin !== self.location.origin || event.request.method !== "GET" || url.pathname.startsWith("/api/")) return;
   event.respondWith(
     caches.match(event.request).then((hit) => {
       if (hit) return hit;

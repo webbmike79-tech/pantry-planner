@@ -18,18 +18,24 @@ Run from the project root:
 
 import io
 import json
+import logging
+import math
 import os
 import re
 import sqlite3
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+logger = logging.getLogger("pantry_planner.main")
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 from PIL import Image
 from pydantic import BaseModel, Field
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.datastructures import UploadFile as StarletteUploadFile
@@ -37,13 +43,37 @@ from starlette.datastructures import UploadFile as StarletteUploadFile
 from google import genai
 from google.genai import types
 
+from api.ai_fallback import (
+    ProviderKeys,
+    extract_provider_keys,
+    extract_provider_models,
+    generate_structured_with_fallback,
+    validate_provider_key,
+    save_provider_model_with_validation,
+    probe_all_providers,
+    get_providers_status,
+)
+from api.religious_diet import (
+    check_meal_violation,
+    build_religious_diet_prompt_section,
+)
+
 # ==========================================
 # PATHS
 # ==========================================
 
 BASE_DIR = Path(__file__).resolve().parent.parent  # project root (holds app.py)
 STATIC_DIR = Path(__file__).resolve().parent / "static"
-DB_FILE = os.environ.get("PANTRY_DB_FILE", str(BASE_DIR / "pantry_planner.db"))
+
+def get_db_file() -> str:
+    path = os.environ.get("PANTRY_DB_FILE")
+    if not path:
+        if os.environ.get("PANTRY_TEST_MODE"):
+            raise RuntimeError("CRITICAL: PANTRY_TEST_MODE is active but PANTRY_DB_FILE is not set! Aborting to protect live database.")
+        path = str(BASE_DIR / "pantry_planner.db")
+    return path
+
+DB_FILE = get_db_file()
 
 # Theme names (from app.py's THEMES). The PWA ships with the current season's
 # palette baked into CSS; the backend only needs the name for the AI prompt.
@@ -112,11 +142,23 @@ class MealDetail(BaseModel):
         description="Step-by-step cooking instructions (include air fryer, oven, or stovetop guidance)"
     )
     cook_time_minutes: int = Field(description="Estimated cooking time in minutes")
+    changed_from: Optional[str] = Field(
+        default=None, description="Name of the previous meal if this meal slot was swapped"
+    )
 
 
 class DayMealPlan(BaseModel):
     day: str = Field(description="Day of the week (e.g., Monday)")
     headcount: int = Field(description="Number of people being fed this day")
+    servings: Optional[int] = Field(
+        default=None, description="Servings for this day (defaults to headcount / household size)"
+    )
+    is_overridden: bool = Field(
+        default=False, description="Whether this day's servings was manually overridden"
+    )
+    servings_override: bool = Field(
+        default=False, description="Alias for is_overridden"
+    )
     breakfast: MealDetail
     lunch: MealDetail
     dinner: MealDetail
@@ -156,6 +198,29 @@ class WeeklyPlanOutput(BaseModel):
     )
 
 
+class MealSwapOutput(BaseModel):
+    found: bool = Field(
+        description="True if an on-hand recipe satisfying all rules was found, False otherwise"
+    )
+    dish_name: str = Field(
+        default="", description="Name of the replacement meal. Empty if found is False"
+    )
+    prep_steps: List[str] = Field(
+        default_factory=list, description="Step-by-step preparation steps"
+    )
+    cook_time_minutes: int = Field(
+        default=0, description="Estimated cooking time in minutes"
+    )
+    ingredients_used: List[UsedIngredient] = Field(
+        default_factory=list,
+        description="Ingredients deducted from remaining on-hand inventory for this replacement meal",
+    )
+    reason_if_not_found: str = Field(
+        default="",
+        description="Brief plain explanation if no on-hand recipe satisfies the constraints, e.g. 'Nothing else on hand fits this slot'",
+    )
+
+
 class ReceiptLineItem(BaseModel):
     item_name: str = Field(
         description="Decoded, human-readable food/drink/seasoning name from the receipt"
@@ -184,7 +249,7 @@ class ReceiptScanResult(BaseModel):
 
 
 def init_db():
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(get_db_file())
     c = conn.cursor()
     c.execute(
         """
@@ -206,10 +271,15 @@ def init_db():
             base_headcount INTEGER,
             dietary_tags TEXT,
             custom_diet_notes TEXT,
-            essential_staples TEXT
+            essential_staples TEXT,
+            religious_presets TEXT DEFAULT '[]'
         )
     """
     )
+    try:
+        c.execute("ALTER TABLE settings ADD COLUMN religious_presets TEXT DEFAULT '[]'")
+    except Exception:
+        pass
     c.execute(
         """
         CREATE TABLE IF NOT EXISTS saved_plans (
@@ -227,8 +297,8 @@ def init_db():
         )
         c.execute(
             """
-            INSERT INTO settings (id, base_headcount, dietary_tags, custom_diet_notes, essential_staples)
-            VALUES (1, 2, ?, 'Provide wholesome meals tailored to any household restrictions entered below.', ?)
+            INSERT INTO settings (id, base_headcount, dietary_tags, custom_diet_notes, essential_staples, religious_presets)
+            VALUES (1, 2, ?, 'Provide wholesome meals tailored to any household restrictions entered below.', ?, '[]')
         """,
             (default_tags, default_staples),
         )
@@ -237,7 +307,7 @@ def init_db():
 
 
 def add_inventory_items(location: str, items: List[DetectedItem]):
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(get_db_file())
     c = conn.cursor()
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
     for item in items:
@@ -253,7 +323,7 @@ def add_inventory_items(location: str, items: List[DetectedItem]):
 
 
 def get_inventory_df() -> pd.DataFrame:
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(get_db_file())
     df = pd.read_sql_query("SELECT * FROM inventory ORDER BY location, category, item_name", conn)
     conn.close()
     return df
@@ -261,28 +331,43 @@ def get_inventory_df() -> pd.DataFrame:
 
 def get_inventory() -> List[dict]:
     """Inventory as a list of plain dicts (JSON-friendly types)."""
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(get_db_file())
     conn.row_factory = sqlite3.Row
     rows = conn.execute(
-        "SELECT * FROM inventory ORDER BY location, category, item_name"
+        "SELECT id, location, item_name, category, quantity, unit, updated_at FROM inventory ORDER BY location, category, item_name"
     ).fetchall()
     conn.close()
-    return [
-        {
-            "id": int(r["id"]),
-            "location": r["location"],
-            "item_name": r["item_name"],
-            "category": r["category"],
-            "quantity": float(r["quantity"]) if r["quantity"] is not None else 0.0,
-            "unit": r["unit"],
-            "updated_at": r["updated_at"],
-        }
-        for r in rows
-    ]
+    items = []
+    for r in rows:
+        try:
+            items.append(
+                {
+                    "id": int(r["id"]),
+                    "location": r["location"],
+                    "item_name": r["item_name"],
+                    "category": r["category"],
+                    "quantity": float(r["quantity"]) if r["quantity"] is not None else 0.0,
+                    "unit": r["unit"],
+                    "updated_at": r["updated_at"],
+                }
+            )
+        except (TypeError, KeyError, IndexError):
+            items.append(
+                {
+                    "id": int(r[0]),
+                    "location": r[1],
+                    "item_name": r[2],
+                    "category": r[3],
+                    "quantity": float(r[4]) if r[4] is not None else 0.0,
+                    "unit": r[5],
+                    "updated_at": r[6],
+                }
+            )
+    return items
 
 
 def clear_inventory():
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(get_db_file())
     conn.execute("DELETE FROM inventory")
     conn.commit()
     conn.close()
@@ -294,7 +379,7 @@ def replace_inventory_from_df(df: pd.DataFrame):
     # save renumbered the inventory and broke the inventory_id references
     # stored in saved meal plans. Rows carrying a valid existing id keep it;
     # brand-new rows (id empty/NaN) get a fresh id.
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(get_db_file())
     c = conn.cursor()
     c.execute("DELETE FROM inventory")
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -339,8 +424,98 @@ def replace_inventory_from_df(df: pd.DataFrame):
 
 
 
+COUNTABLE_UNITS = {
+    "can", "cans",
+    "clove", "cloves",
+    "egg", "eggs",
+    "count", "item", "items", "piece", "pieces",
+    "bottle", "bottles",
+    "box", "boxes",
+    "bag", "bags",
+    "head", "heads",
+    "loaf", "loaves",
+    "packet", "packets", "pack", "packs",
+    "stalk", "stalks",
+    "bunch", "bunches",
+}
+
+
+def is_countable_unit(unit: Optional[str]) -> bool:
+    if not unit:
+        return False
+    return unit.strip().lower() in COUNTABLE_UNITS
+
+
+def round_scaled_quantity(val: float, unit: Optional[str]) -> float:
+    """Rounding rule (Part 2 Rule 5):
+    - Countable whole items round UP to the next whole number, minimum 1.
+    - Fractional measures round to the nearest 0.25 (minimum 0.25 if val > 0).
+    """
+    if val <= 0:
+        return 0.0
+    if is_countable_unit(unit):
+        return float(max(1, math.ceil(val)))
+    else:
+        rounded = round(val * 4.0) / 4.0
+        if val > 0 and rounded == 0.0:
+            rounded = 0.25
+        return rounded
+
+
+def scale_amount_needed_str(amount_needed: str, ratio: float, unit: Optional[str]) -> str:
+    """Scales leading number in amount_needed string if parseable.
+    If any ingredient quantity is free text with no parseable number, leave its text unchanged.
+    """
+    if not amount_needed:
+        return amount_needed
+    m = re.match(r"^(\d+(?:\.\d+)?)\s*(.*)$", amount_needed.strip())
+    if not m:
+        return amount_needed
+    old_num = float(m.group(1))
+    rest = m.group(2)
+    new_num = round_scaled_quantity(old_num * ratio, unit)
+    num_str = str(int(new_num)) if new_num.is_integer() else str(new_num)
+    return f"{num_str} {rest}".strip() if rest else num_str
+
+
+def scale_day_ingredients_and_shopping(plan: dict, day_name: str, old_servings: int, new_servings: int):
+    """Rescales a single day's ingredient deductions and matching shopping list items by new ÷ old."""
+    if old_servings <= 0 or new_servings <= 0 or old_servings == new_servings:
+        return
+    ratio = float(new_servings) / float(old_servings)
+    d_clean = (day_name or "").lower().strip()
+
+    # 1. Rescale ingredients_to_deduct on that day
+    for d in plan.get("menu", []):
+        if (d.get("day") or "").lower().strip() == d_clean:
+            for ing in d.get("ingredients_to_deduct", []):
+                amt = float(ing.get("amount_used", 0.0))
+                u = ing.get("unit", "")
+                ing["amount_used"] = round_scaled_quantity(amt * ratio, u)
+            break
+
+    # 2. Rescale shopping list items that belong to that day
+    all_days = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+    for item in plan.get("shopping_list", []):
+        reason = (item.get("reason") or "").lower()
+        item_day = (item.get("day") or "").lower().strip()
+        belongs = False
+        if item_day == d_clean:
+            belongs = True
+        elif d_clean in reason:
+            other_days = [o for o in all_days if o != d_clean and o in reason]
+            if not other_days:
+                belongs = True
+
+        if belongs:
+            num_qty = float(item.get("numeric_quantity", 0.0))
+            u = item.get("unit", "")
+            item["numeric_quantity"] = round_scaled_quantity(num_qty * ratio, u)
+            item["amount_needed"] = scale_amount_needed_str(item.get("amount_needed", ""), ratio, u)
+
+
 def deduct_day_from_inventory(plan_id: int, day_idx: int) -> List[str]:
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(get_db_file())
     c = conn.cursor()
     c.execute("SELECT plan_json FROM saved_plans WHERE id = ?", (plan_id,))
     row = c.fetchone()
@@ -396,7 +571,7 @@ def deduct_day_from_inventory(plan_id: int, day_idx: int) -> List[str]:
 
 
 def restock_checked_shopping_items(plan_id: int, item_indices: List[int]) -> List[str]:
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(get_db_file())
     c = conn.cursor()
     c.execute("SELECT plan_json FROM saved_plans WHERE id = ?", (plan_id,))
     row = c.fetchone()
@@ -464,10 +639,39 @@ def restock_checked_shopping_items(plan_id: int, item_indices: List[int]) -> Lis
     return restocked_log
 
 
+def clear_purchased_shopping_items(plan_id: int) -> int:
+    """Remove all items already marked purchased from the plan's shopping list.
+
+    Returns the number of items removed. Inventory is not touched.
+    """
+    conn = sqlite3.connect(get_db_file())
+    c = conn.cursor()
+    c.execute("SELECT plan_json FROM saved_plans WHERE id = ?", (plan_id,))
+    row = c.fetchone()
+    if not row:
+        conn.close()
+        return 0
+
+    plan_data = json.loads(row[0])
+    shopping_list = plan_data.get("shopping_list", [])
+    remaining = [i for i in shopping_list if not i.get("purchased", False)]
+    removed = len(shopping_list) - len(remaining)
+
+    if removed:
+        plan_data["shopping_list"] = remaining
+        c.execute(
+            "UPDATE saved_plans SET plan_json = ? WHERE id = ?",
+            (json.dumps(plan_data), plan_id),
+        )
+        conn.commit()
+    conn.close()
+    return removed
+
+
 def process_scanned_receipt_items(
     plan_id: Optional[int], receipt_items: List[ReceiptLineItem]
 ) -> List[str]:
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(get_db_file())
     c = conn.cursor()
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
 
@@ -542,56 +746,155 @@ def process_scanned_receipt_items(
 
 
 def get_settings():
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(get_db_file())
     c = conn.cursor()
-    c.execute(
-        "SELECT base_headcount, dietary_tags, custom_diet_notes, essential_staples FROM settings WHERE id = 1"
-    )
-    row = c.fetchone()
+    try:
+        c.execute(
+            "SELECT base_headcount, dietary_tags, custom_diet_notes, essential_staples, religious_presets FROM settings WHERE id = 1"
+        )
+        row = c.fetchone()
+    except Exception:
+        c.execute(
+            "SELECT base_headcount, dietary_tags, custom_diet_notes, essential_staples FROM settings WHERE id = 1"
+        )
+        row = c.fetchone()
     conn.close()
+    if not row:
+        return {
+            "base_headcount": 2,
+            "dietary_tags": ["Balanced & Whole Foods"],
+            "custom_diet_notes": "",
+            "essential_staples": "",
+            "religious_presets": [],
+        }
+    r_presets = []
+    if len(row) > 4 and row[4]:
+        try:
+            r_presets = json.loads(row[4]) if isinstance(row[4], str) else row[4]
+        except Exception:
+            r_presets = []
     return {
         "base_headcount": row[0],
-        "dietary_tags": json.loads(row[1]),
+        "dietary_tags": json.loads(row[1]) if isinstance(row[1], str) else row[1],
         "custom_diet_notes": row[2],
         "essential_staples": row[3],
+        "religious_presets": r_presets,
     }
 
 
-def save_settings(base_headcount: int, dietary_tags: list, custom_notes: str, staples: str):
-    conn = sqlite3.connect(DB_FILE)
+def save_settings(base_headcount: int, dietary_tags: list, custom_notes: str, staples: str, religious_presets: Optional[list] = None):
+    conn = sqlite3.connect(get_db_file())
     c = conn.cursor()
-    c.execute(
-        """
-        UPDATE settings
-        SET base_headcount = ?, dietary_tags = ?, custom_diet_notes = ?, essential_staples = ?
-        WHERE id = 1
-    """,
-        (base_headcount, json.dumps(dietary_tags), custom_notes, staples),
-    )
+    presets_json = json.dumps(religious_presets if religious_presets is not None else [])
+    try:
+        c.execute(
+            """
+            UPDATE settings
+            SET base_headcount = ?, dietary_tags = ?, custom_diet_notes = ?, essential_staples = ?, religious_presets = ?
+            WHERE id = 1
+        """,
+            (base_headcount, json.dumps(dietary_tags), custom_notes, staples, presets_json),
+        )
+    except Exception:
+        c.execute(
+            """
+            UPDATE settings
+            SET base_headcount = ?, dietary_tags = ?, custom_diet_notes = ?, essential_staples = ?
+            WHERE id = 1
+        """,
+            (base_headcount, json.dumps(dietary_tags), custom_notes, staples),
+        )
     conn.commit()
     conn.close()
 
+    # Part 2 Rule 3: Mid-week household change updates non-overridden days of active plan
+    plan_id, created_at, plan = get_latest_plan()
+    if plan_id is not None and plan and isinstance(plan, dict):
+        menu = plan.get("menu", [])
+        changed = False
+        for d in menu:
+            is_ov = d.get("is_overridden") or d.get("servings_override")
+            if not is_ov:
+                old_s = d.get("servings") or d.get("headcount") or base_headcount
+                if old_s != base_headcount:
+                    scale_day_ingredients_and_shopping(plan, d.get("day", ""), old_s, base_headcount)
+                    d["servings"] = base_headcount
+                    d["headcount"] = base_headcount
+                    d["is_overridden"] = False
+                    d["servings_override"] = False
+                    changed = True
+        if changed:
+            conn = sqlite3.connect(get_db_file())
+            c = conn.cursor()
+            c.execute("UPDATE saved_plans SET plan_json = ? WHERE id = ?", (json.dumps(plan), plan_id))
+            conn.commit()
+            conn.close()
+
 
 def save_plan(plan_dict: dict):
-    conn = sqlite3.connect(DB_FILE)
+    # Normalize per-day servings on newly saved plan
+    settings = get_settings()
+    base_hc = settings.get("base_headcount", 2)
+    for d in plan_dict.get("menu", []):
+        if d.get("servings") is None:
+            d["servings"] = d.get("headcount", base_hc)
+        if "is_overridden" not in d:
+            d["is_overridden"] = False
+        if "servings_override" not in d:
+            d["servings_override"] = False
+
+    conn = sqlite3.connect(get_db_file())
     c = conn.cursor()
     c.execute(
         "INSERT INTO saved_plans (created_at, plan_json) VALUES (?, ?)",
         (datetime.now().strftime("%Y-%m-%d %H:%M"), json.dumps(plan_dict)),
     )
+    plan_id = c.lastrowid
     conn.commit()
     conn.close()
+    return plan_id
 
 
 def get_latest_plan():
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(get_db_file())
     c = conn.cursor()
     c.execute("SELECT id, created_at, plan_json FROM saved_plans ORDER BY id DESC LIMIT 1")
     row = c.fetchone()
     conn.close()
-    if row:
-        return row[0], row[1], json.loads(row[2])
-    return None, None, None
+    if not row:
+        return None, None, None
+    plan = json.loads(row[2])
+    # Part 2 Rule 7: Migration for pre-feature saved plans (no servings data)
+    settings = get_settings()
+    base_hc = settings.get("base_headcount", 2)
+    for d in plan.get("menu", []):
+        if d.get("servings") is None:
+            d["servings"] = d.get("headcount", base_hc)
+        if "is_overridden" not in d:
+            d["is_overridden"] = False
+        if "servings_override" not in d:
+            d["servings_override"] = False
+    return row[0], row[1], plan
+
+
+def update_saved_plan(plan_id: int, plan_dict: dict):
+    conn = sqlite3.connect(get_db_file())
+    c = conn.cursor()
+    c.execute(
+        "UPDATE saved_plans SET plan_json = ? WHERE id = ?",
+        (json.dumps(plan_dict), plan_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def clear_saved_plans():
+    """Delete all rows from saved_plans, completely clearing the current menu and shopping list."""
+    conn = sqlite3.connect(get_db_file())
+    c = conn.cursor()
+    c.execute("DELETE FROM saved_plans")
+    conn.commit()
+    conn.close()
 
 
 
@@ -606,44 +909,102 @@ def get_client(api_key: str):
     return genai.Client(api_key=api_key)
 
 
-def _generate_structured(api_key: str, contents, schema, temperature: float, what: str):
-    """Shared Gemini structured-output call with friendly error wrapping."""
-    try:
-        client = get_client(api_key)
-        response = client.models.generate_content(
-            model="gemini-3.8-flash",
-            contents=contents,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_schema=schema,
-                temperature=temperature,
-            ),
-        )
-    except Exception as e:
-        raise RuntimeError(f"Gemini could not {what}. API error: {e}") from e
-    if not getattr(response, "text", None):
-        raise RuntimeError(
-            f"Gemini returned an empty response while trying to {what}. Please try again."
-        )
-    try:
-        return schema.model_validate_json(response.text)
-    except Exception as e:
-        raise RuntimeError(
-            f"Gemini returned data in an unexpected format while trying to {what}. Please try again. ({e})"
-        ) from e
+def _generate_structured(
+    keys_or_key,
+    contents,
+    schema,
+    temperature: float,
+    what: str,
+    item_count: Optional[int] = None,
+    action: Optional[str] = None,
+):
+    """Shared structured-output call routed through the AI provider fallback chain."""
+    if isinstance(keys_or_key, ProviderKeys):
+        keys = keys_or_key
+    elif isinstance(keys_or_key, str):
+        keys = ProviderKeys(gemini_key=keys_or_key)
+    else:
+        keys = ProviderKeys()
+    return generate_structured_with_fallback(
+        keys,
+        contents,
+        schema,
+        temperature,
+        what,
+        item_count=item_count,
+        action=action,
+    )
 
 
-def analyze_storage_photo(api_key: str, image: Image.Image, location: str) -> List[DetectedItem]:
+BARE_GENERIC_NAMES = {
+    "frozen food",
+    "food",
+    "meat",
+    "vegetable",
+    "vegetables",
+    "fruit",
+    "dairy",
+    "snack",
+    "snacks",
+    "drink",
+    "beverage",
+    "pantry item",
+    "grocery",
+    "groceries",
+    "item",
+}
+
+
+def normalize_scan_location_tag(location: str) -> str:
+    loc_clean = (location or "").strip()
+    if "pantry" in loc_clean.lower() or "cupboard" in loc_clean.lower():
+        return "Pantry"
+    if "freezer" in loc_clean.lower():
+        return "Freezer"
+    if "fridge" in loc_clean.lower():
+        return "Fridge"
+    return loc_clean or "Pantry"
+
+
+def sanitize_scan_items(items: List[DetectedItem], location: str) -> List[DetectedItem]:
+    loc_tag = normalize_scan_location_tag(location)
+    generic_idx = 0
+    sanitized: List[DetectedItem] = []
+    for it in items:
+        clean_name = (it.item_name or "").strip()
+        if clean_name.lower() in BARE_GENERIC_NAMES:
+            generic_idx += 1
+            old_name = it.item_name
+            new_name = f"Unidentified {loc_tag} Item {generic_idx}"
+            logger.info("Generic scan item renamed: '%s' -> '%s' (location=%s)", old_name, new_name, location)
+            it.item_name = new_name
+        sanitized.append(it)
+    return sanitized
+
+
+def analyze_storage_photo(keys, image: Image.Image, location: str) -> Tuple[List[DetectedItem], str]:
     prompt = f"""
     You are scanning a user's {location}.
     Identify all visible food items, ingredients, veggies, drinks, and seasonings.
     Estimate the remaining quantity and unit for each item as accurately as possible
     (e.g., 0.5 gallon, 2 cans, 12 oz, 1 bottle).
+
+    NAMING RULES (STRICT ENFORCEMENT):
+    NEVER use a bare category or storage word as an item name (examples banned: "Frozen Food", "Food", "Meat", "Vegetables", "Pantry Item"). Name items by, in order:
+    1. Printed label/brand text visible on the packaging (e.g. "Campbell's Tomato Soup", "Eggo Waffles").
+    2. The specific food you can see (e.g. "Frozen Mixed Vegetables", "Frozen Chicken Breasts", "Frozen Pizza").
+    3. Only if genuinely indeterminate, a descriptive visible-form name (e.g. "Unidentified frozen item — green bag") so a human can rename it in review.
+
+    ANTI-CONFABULATION & LEGIBILITY RULES (MANDATORY):
+    - NEVER output a brand or product name unless its text is actually legible in the image. If a label is visible but unreadable, name the item by its visible kind only ("BBQ Sauce", not an invented brand).
+    - NEVER claim contents you cannot see. Opaque, frosted, or sealed items whose contents aren't identifiable from visible text or clear appearance get a descriptive visible-form name (rule 3 of the hierarchy above) — never a guessed food, species, or cut. (A frosty bag is "Clear Bag with Frozen Meat", never "Frozen Pheasant".)
+    - When torn between two specific readings, choose the LESS specific honest one.
     """
-    parsed = _generate_structured(
-        api_key, [image, prompt], VisionInventoryResult, 0.2, f"scan your {location} photo"
+    parsed, served_by = _generate_structured(
+        keys, [image, prompt], VisionInventoryResult, 0.2, f"scan your {location} photo"
     )
-    return parsed.items
+    sanitized_items = sanitize_scan_items(parsed.items, location)
+    return sanitized_items, served_by
 
 
 def _receipt_prompt(shopping_list: list, source_description: str) -> str:
@@ -672,59 +1033,69 @@ def _receipt_prompt(shopping_list: list, source_description: str) -> str:
 
 
 def analyze_grocery_receipt(
-    api_key: str, image: Image.Image, shopping_list: list
-) -> ReceiptScanResult:
+    keys, image: Image.Image, shopping_list: list
+) -> Tuple[ReceiptScanResult, str]:
     prompt = _receipt_prompt(shopping_list, "a grocery store receipt image")
     return _generate_structured(
-        api_key, [image, prompt], ReceiptScanResult, 0.1, "read your grocery receipt"
+        keys, [image, prompt], ReceiptScanResult, 0.1, "read your grocery receipt"
     )
 
 
 def analyze_receipt_pdf(
-    api_key: str, pdf_bytes: bytes, shopping_list: list
-) -> ReceiptScanResult:
+    keys, pdf_bytes: bytes, shopping_list: list
+) -> Tuple[ReceiptScanResult, str]:
     prompt = _receipt_prompt(
         shopping_list, "a grocery store receipt or online grocery order document (PDF)"
     )
     pdf_part = types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf")
     return _generate_structured(
-        api_key, [pdf_part, prompt], ReceiptScanResult, 0.1, "read your grocery receipt"
+        keys, [pdf_part, prompt], ReceiptScanResult, 0.1, "read your grocery receipt"
     )
 
 
 def analyze_receipt_text(
-    api_key: str, text: str, shopping_list: list
-) -> ReceiptScanResult:
+    keys, text: str, shopping_list: list
+) -> Tuple[ReceiptScanResult, str]:
     prompt = _receipt_prompt(
         shopping_list,
         "pasted text from a grocery store receipt or online grocery order confirmation",
     )
     contents = f"{prompt}\nRECEIPT / ORDER TEXT:\n{text}"
     return _generate_structured(
-        api_key, contents, ReceiptScanResult, 0.1, "read your grocery receipt"
+        keys, contents, ReceiptScanResult, 0.1, "read your grocery receipt"
     )
 
 
 def generate_weekly_menu_and_list(
-    api_key: str,
+    keys,
     inventory_df: pd.DataFrame,
     settings: dict,
     daily_headcounts: dict,
     active_theme: str,
-) -> WeeklyPlanOutput:
+) -> Tuple[WeeklyPlanOutput, str]:
     if inventory_df.empty:
         inv_records = []
     else:
-        inv_records = inventory_df[
-            ["id", "location", "item_name", "category", "quantity", "unit"]
-        ].to_dict(orient="records")
+        inv_records = [
+            {
+                "n": r.get("item_name") or r.get("n", ""),
+                "q": r.get("quantity") if "quantity" in r else r.get("q", 0.0),
+                "u": r.get("unit") or r.get("u", ""),
+                "l": r.get("location") or r.get("l", ""),
+                "c": r.get("category") or r.get("c", ""),
+            }
+            for _, r in inventory_df.iterrows()
+        ]
+
+    rel_presets = settings.get("religious_presets", [])
+    rel_section = build_religious_diet_prompt_section(rel_presets)
 
     prompt = f"""
     Build a practical, delicious 7-day meal plan and a consolidated shopping list.
     Current Season/Holiday Context: {active_theme}
 
-    CURRENT KITCHEN INVENTORY (Cupboard, Fridge, Freezer):
-    {json.dumps(inv_records, indent=2)}
+    CURRENT KITCHEN INVENTORY (keys: n=item_name, q=quantity, u=unit, l=location, c=category):
+    {json.dumps(inv_records, separators=(',', ':'))}
 
     DAILY HEADCOUNT SCHEDULE (Scale portion sizes and ingredient math to match each day):
     {json.dumps(daily_headcounts, indent=2)}
@@ -733,8 +1104,10 @@ def generate_weekly_menu_and_list(
     - Selected Tags/Diets: {", ".join(settings["dietary_tags"])}
     - Specific Household Rules & Allergies: {settings["custom_diet_notes"]}
 
+    {rel_section}
+
     DIETARY ENFORCEMENT RULES FOR THE AI:
-    1. STRICTLY OBEY all dietary tags, medical restrictions, and food allergies specified by the household above. Avoid all allergens and restricted ingredients completely across every meal.
+    1. STRICTLY OBEY all dietary tags, medical restrictions, religious presets, and food allergies specified by the household above. Avoid all allergens and restricted ingredients completely across every meal.
     2. Provide clear step-by-step preparation instructions for breakfast, lunch, and dinner, including timings and recommendations for countertop appliances (like an air fryer or stovetop/oven).
 
     INSTRUCTIONS:
@@ -745,7 +1118,57 @@ def generate_weekly_menu_and_list(
     """
 
     return _generate_structured(
-        api_key, prompt, WeeklyPlanOutput, 0.3, "build your weekly menu"
+        keys,
+        prompt,
+        WeeklyPlanOutput,
+        0.3,
+        "build your weekly menu",
+        item_count=len(inv_records),
+        action="generate_plan",
+    )
+
+
+def swap_single_meal(
+    keys,
+    available_inventory: list,
+    target_slot: str,
+    current_dish_name: str,
+    other_meals: list,
+    headcount: int,
+    settings: dict,
+) -> Tuple[MealSwapOutput, str]:
+    """Re-picks a single meal slot using ONLY on-hand ingredients.
+    
+    Routes through the Milestone 5 provider fallback chain.
+    """
+    rel_presets = settings.get("religious_presets", [])
+    rel_section = build_religious_diet_prompt_section(rel_presets)
+
+    prompt = f"""
+    You are swapping out a single meal for {target_slot.upper()}.
+    
+    RULES FOR THE REPLACEMENT MEAL:
+    1. It MUST be buildable entirely from ingredients currently on hand in AVAILABLE INVENTORY.
+       Every ingredient used must exist in AVAILABLE INVENTORY with sufficient remaining quantity.
+       DO NOT propose any ingredient not in AVAILABLE INVENTORY or exceeding available quantity.
+       DO NOT create any new shopping list items.
+    2. It MUST NOT be "{current_dish_name}" (the meal being swapped out).
+    3. It SHOULD NOT duplicate any other meal already planned this week: {json.dumps(other_meals)}
+    4. Household Dietary Rules (STRICT ENFORCEMENT):
+       - Selected Tags/Diets: {", ".join(settings["dietary_tags"])}
+       - Specific Household Rules & Allergies: {settings["custom_diet_notes"]}
+       {rel_section}
+       The replacement must strictly comply with all dietary tags, religious presets, and allergies.
+    5. Scale portion sizes accurately for a headcount of {headcount} people.
+    6. For each ingredient in `ingredients_used`, reference the exact `inventory_id` (matching the id in AVAILABLE INVENTORY), `item_name`, numeric `amount_used`, and `unit`.
+    7. IF NO ON-HAND REPLACEMENT SATISFIES ALL THE RULES: set `found` to False, leave `dish_name` empty, and set `reason_if_not_found` to "Nothing else on hand fits this slot". NEVER invent ingredients or ignore dietary rules.
+
+    AVAILABLE INVENTORY (Items on hand after committed usage):
+    {json.dumps(available_inventory, indent=2)}
+    """
+
+    return _generate_structured(
+        keys, prompt, MealSwapOutput, 0.2, "swap meal"
     )
 
 
@@ -801,6 +1224,21 @@ def build_shopping_markdown(plan: dict, created_at: Optional[str], include_purch
 
 app = FastAPI(title="Pantry-to-Menu Planner API", version="1.0.0")
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost",
+        "https://localhost",
+        "capacitor://localhost",
+        "http://localhost:8000",
+        "http://127.0.0.1:8000",
+    ],
+    allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1|192\.168\.\d+\.\d+|10\.\d+\.\d+\.\d+|172\.(1[6-9]|2\d|3[0-1])\.\d+\.\d+)(:\d+)?$",
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 init_db()
 
 
@@ -827,6 +1265,7 @@ class SettingsIn(BaseModel):
     dietary_tags: List[str] = []
     custom_diet_notes: str = ""
     essential_staples: str = ""
+    religious_presets: List[str] = []
 
 
 class GeneratePlanRequest(BaseModel):
@@ -836,6 +1275,18 @@ class GeneratePlanRequest(BaseModel):
 
 class CookRequest(BaseModel):
     day_index: int
+
+
+class SwapMealRequest(BaseModel):
+    day_index: int
+    meal_slot: str  # 'breakfast', 'lunch', or 'dinner'
+
+
+class DayServingsRequest(BaseModel):
+    day_index: Optional[int] = None
+    day: Optional[str] = None
+    servings: Optional[int] = None
+    reset: bool = False
 
 
 class RestockRequest(BaseModel):
@@ -849,26 +1300,31 @@ class ReceiptPasteRequest(BaseModel):
 # ---------- Helpers ----------
 
 
-def require_gemini_key(request: Request) -> str:
-    """Gemini key: X-Gemini-Key header first, else GEMINI_API_KEY env var."""
-    key = request.headers.get("x-gemini-key") or os.environ.get("GEMINI_API_KEY", "")
-    if not key:
+def require_ai_keys(request: Request) -> ProviderKeys:
+    """Extract AI keys: Gemini, Groq, OpenRouter from headers or config."""
+    keys = extract_provider_keys(request.headers)
+    if not (keys.gemini_key or keys.groq_key or keys.openrouter_key):
         raise HTTPException(
             status_code=400,
             detail=(
-                "No Gemini API key available. Enter your key in the app "
-                "(Diet tab) or set the GEMINI_API_KEY environment variable."
+                "No AI API key configured on the server. Please enter your Gemini API key "
+                "(or Groq/OpenRouter fallback key) in Settings."
             ),
         )
-    return key
+    return keys
 
 
-def gemini_call(fn, *args):
-    """Run a Gemini function, converting friendly RuntimeErrors to HTTP 502."""
+def ai_call(fn, *args):
+    """Run an AI function, converting friendly RuntimeErrors to HTTP 502."""
     try:
         return fn(*args)
     except RuntimeError as e:
         raise HTTPException(status_code=502, detail=str(e)) from e
+
+
+# Legacy aliases for backward compatibility if any test calls them
+require_gemini_key = require_ai_keys
+gemini_call = ai_call
 
 
 async def load_image(upload: UploadFile) -> Image.Image:
@@ -893,7 +1349,7 @@ def latest_plan_payload():
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "app": "pantry-planner"}
 
 
 # ---------- Inventory ----------
@@ -913,7 +1369,15 @@ def api_add_inventory(body: AddInventoryRequest):
 
 
 @app.put("/api/inventory")
-def api_replace_inventory(items: List[InventoryItemIn]):
+def api_replace_inventory(
+    items: List[InventoryItemIn],
+    confirm_clear: bool = Query(False, alias="confirm_clear"),
+):
+    if len(items) == 0 and not confirm_clear:
+        raise HTTPException(
+            status_code=400,
+            detail="Clearing inventory to empty requires explicit confirm_clear confirmation.",
+        )
     df = pd.DataFrame(
         [
             {
@@ -934,7 +1398,14 @@ def api_replace_inventory(items: List[InventoryItemIn]):
 
 
 @app.delete("/api/inventory")
-def api_clear_inventory():
+def api_clear_inventory(
+    confirm_clear: bool = Query(False, alias="confirm_clear"),
+):
+    if not confirm_clear:
+        raise HTTPException(
+            status_code=400,
+            detail="Clearing inventory requires explicit confirm_clear confirmation.",
+        )
     clear_inventory()
     return {"inventory": []}
 
@@ -949,7 +1420,13 @@ def api_get_settings():
 
 @app.put("/api/settings")
 def api_save_settings(body: SettingsIn):
-    save_settings(body.base_headcount, body.dietary_tags, body.custom_diet_notes, body.essential_staples)
+    save_settings(
+        body.base_headcount,
+        body.dietary_tags,
+        body.custom_diet_notes,
+        body.essential_staples,
+        religious_presets=body.religious_presets,
+    )
     return get_settings()
 
 
@@ -964,15 +1441,29 @@ async def api_scan_photo(
 ):
     if location not in LOCATIONS:
         raise HTTPException(status_code=400, detail=f"Unknown location: {location}")
-    api_key = require_gemini_key(request)
-    image = await load_image(file)
-    detected = gemini_call(analyze_storage_photo, api_key, image, location)
-    add_inventory_items(location, detected)
-    return {
-        "added": len(detected),
-        "items": [d.model_dump() for d in detected],
-        "inventory": get_inventory(),
-    }
+    keys = require_ai_keys(request)
+    try:
+        image = await load_image(file)
+        try:
+            detected, served_by = ai_call(analyze_storage_photo, keys, image, location)
+            add_inventory_items(location, detected)
+            return {
+                "added": len(detected),
+                "items": [d.model_dump() for d in detected],
+                "inventory": get_inventory(),
+                "served_by": served_by,
+            }
+        finally:
+            if hasattr(image, "close"):
+                try:
+                    image.close()
+                except Exception:
+                    pass
+    finally:
+        try:
+            await file.close()
+        except Exception:
+            pass
 
 
 # ---------- Weekly plan ----------
@@ -980,24 +1471,118 @@ async def api_scan_photo(
 
 @app.post("/api/plan/generate")
 def api_generate_plan(body: GeneratePlanRequest, request: Request):
-    api_key = require_gemini_key(request)
+    keys = require_ai_keys(request)
     settings = get_settings()
     theme = body.theme_name or get_auto_theme_name()
-    plan_output = gemini_call(
+    plan_output, served_by = ai_call(
         generate_weekly_menu_and_list,
-        api_key,
+        keys,
         get_inventory_df(),
         settings,
         body.daily_headcounts,
         theme,
     )
-    save_plan(plan_output.model_dump())
-    return latest_plan_payload()
+    plan_dict = plan_output.model_dump()
+    base_hc = settings.get("base_headcount", 2)
+    rel_presets = settings.get("religious_presets", [])
+
+    # Deterministic verification of generated plan meals
+    if rel_presets:
+        for day in plan_dict.get("menu", []):
+            day_name = day.get("day", "")
+            for slot in ("breakfast", "lunch", "dinner"):
+                meal = day.get(slot)
+                if meal and isinstance(meal, dict):
+                    ing_names = meal.get("prep_steps", [])
+                    is_violation, reason = check_meal_violation(
+                        dish_name=meal.get("dish_name", ""),
+                        ingredients=ing_names,
+                        active_presets=rel_presets,
+                        day_name=day_name,
+                    )
+                    if is_violation:
+                        raise HTTPException(
+                            status_code=502,
+                            detail=f"Generated plan violated dietary policy: {reason}. Please re-generate."
+                        )
+
+    # Part 2 Rule 1 & 4: fresh weekly plan always starts with all 7 days at current household size and no overrides
+    for d in plan_dict.get("menu", []):
+        d["servings"] = base_hc
+        d["headcount"] = base_hc
+        d["is_overridden"] = False
+        d["servings_override"] = False
+    save_plan(plan_dict)
+    payload = latest_plan_payload()
+    payload["served_by"] = served_by
+    return payload
 
 
 @app.get("/api/plan/latest")
 def api_latest_plan():
     return latest_plan_payload()
+
+
+@app.delete("/api/plan")
+def api_clear_plan():
+    """Clear the active menu plan and derived shopping list without touching inventory or settings."""
+    clear_saved_plans()
+    return latest_plan_payload()
+
+
+@app.post("/api/plan/day-servings")
+@app.post("/api/plan/servings")
+def api_update_day_servings(body: DayServingsRequest):
+    """Update or reset a single day's servings for the current week's plan (Part 2 Rule 2 & 5)."""
+    plan_id, _created_at, plan = get_latest_plan()
+    if plan_id is None or plan is None:
+        raise HTTPException(status_code=404, detail="No plan generated yet.")
+    menu = plan.get("menu", [])
+    target_idx = None
+    if body.day_index is not None and 0 <= body.day_index < len(menu):
+        target_idx = body.day_index
+    elif body.day:
+        for idx, d in enumerate(menu):
+            if (d.get("day") or "").lower() == body.day.lower():
+                target_idx = idx
+                break
+    if target_idx is None:
+        raise HTTPException(status_code=400, detail="Invalid day or day_index.")
+
+    day_obj = menu[target_idx]
+    settings = get_settings()
+    base_hc = settings.get("base_headcount", 2)
+    old_servings = day_obj.get("servings") or day_obj.get("headcount") or base_hc
+
+    if body.reset:
+        new_servings = base_hc
+        is_overridden = False
+    else:
+        if body.servings is None or body.servings < 1 or body.servings > 12:
+            raise HTTPException(status_code=400, detail="Servings must be between 1 and 12.")
+        new_servings = body.servings
+        is_overridden = True
+
+    scale_day_ingredients_and_shopping(plan, day_obj.get("day", ""), old_servings, new_servings)
+    day_obj["servings"] = new_servings
+    day_obj["headcount"] = new_servings
+    day_obj["is_overridden"] = is_overridden
+    day_obj["servings_override"] = is_overridden
+
+    conn = sqlite3.connect(get_db_file())
+    c = conn.cursor()
+    c.execute("UPDATE saved_plans SET plan_json = ? WHERE id = ?", (json.dumps(plan), plan_id))
+    conn.commit()
+    conn.close()
+
+    return {
+        "success": True,
+        "day": day_obj.get("day"),
+        "day_index": target_idx,
+        "servings": new_servings,
+        "is_overridden": is_overridden,
+        "plan": plan,
+    }
 
 
 @app.post("/api/plan/cook")
@@ -1015,6 +1600,152 @@ def api_cook_day(body: CookRequest):
     return payload
 
 
+@app.post("/api/plan/swap-meal")
+def api_swap_meal(body: SwapMealRequest, request: Request):
+    """Swap out a single meal slot using ONLY available on-hand ingredients.
+
+    Calculates remaining on-hand inventory (total inventory minus committed
+    deductions for other meals in the week), and requests a replacement meal
+    from the Milestone 5 AI provider chain. If no compliant on-hand meal is
+    found, leaves original meal untouched and returns friendly message.
+    """
+    keys = require_ai_keys(request)
+    plan_id, _created_at, plan = get_latest_plan()
+    if plan_id is None or plan is None:
+        raise HTTPException(status_code=404, detail="No plan generated yet.")
+
+    menu = plan.get("menu", [])
+    if body.day_index < 0 or body.day_index >= len(menu):
+        raise HTTPException(status_code=400, detail=f"day_index out of range: {body.day_index}")
+
+    slot = body.meal_slot.lower().strip()
+    if slot not in ("breakfast", "lunch", "dinner"):
+        raise HTTPException(status_code=400, detail=f"Invalid meal slot: {body.meal_slot}")
+
+    day_obj = menu[body.day_index]
+    current_meal = day_obj.get(slot)
+    if not current_meal or not isinstance(current_meal, dict):
+        raise HTTPException(status_code=400, detail=f"No meal found in {day_obj.get('day')} {slot}")
+
+    current_dish_name = current_meal.get("dish_name", "")
+    settings = get_settings()
+    headcount = day_obj.get("servings") or day_obj.get("headcount") or settings.get("base_headcount", 2)
+
+    # 1. Collect all other meals planned across the week to avoid duplicates
+    other_meals = []
+    for d_idx, d in enumerate(menu):
+        for s in ("breakfast", "lunch", "dinner"):
+            if d_idx == body.day_index and s == slot:
+                continue
+            m = d.get(s)
+            if m and isinstance(m, dict) and m.get("dish_name"):
+                other_meals.append(m["dish_name"])
+
+    # 2. Compute committed inventory usage by all other meals/days
+    # Note: for the target day, all previous deductions are considered tied to the day;
+    # to be conservative and prevent double-spending, any ingredient already listed in
+    # this day or other days is subtracted from total inventory.
+    committed: Dict[int, float] = {}
+    for d_idx, d in enumerate(menu):
+        # We include all deductions across other days
+        if d_idx != body.day_index:
+            for ing in d.get("ingredients_to_deduct", []):
+                inv_id = ing.get("inventory_id")
+                amt = float(ing.get("amount_used", 0.0))
+                if inv_id is not None and amt > 0:
+                    committed[inv_id] = committed.get(inv_id, 0.0) + amt
+
+    # 3. Calculate remaining on-hand inventory
+    all_inv = get_inventory()
+    available_inv = []
+    for item in all_inv:
+        item_id = item["id"]
+        total_qty = float(item.get("quantity") or 0.0)
+        rem_qty = round(total_qty - committed.get(item_id, 0.0), 2)
+        if rem_qty > 0.01:
+            available_inv.append({
+                "id": item_id,
+                "location": item.get("location"),
+                "item_name": item.get("item_name"),
+                "category": item.get("category"),
+                "quantity": rem_qty,
+                "unit": item.get("unit"),
+            })
+
+    if not available_inv:
+        return {
+            "success": False,
+            "message": "Nothing else on hand fits this slot",
+            "plan_id": plan_id,
+            "plan": plan,
+            "served_by": "",
+        }
+
+    # 4. Route AI call through Milestone 5 fallback chain
+    swap_res, served_by = ai_call(
+        swap_single_meal,
+        keys,
+        available_inv,
+        slot,
+        current_dish_name,
+        other_meals,
+        headcount,
+        settings,
+    )
+
+    if not swap_res.found or not swap_res.dish_name:
+        msg = swap_res.reason_if_not_found or "Nothing else on hand fits this slot"
+        return {
+            "success": False,
+            "message": msg,
+            "plan_id": plan_id,
+            "plan": plan,
+            "served_by": served_by,
+        }
+
+    # Deterministic religious diet preset verification
+    rel_presets = settings.get("religious_presets", [])
+    if rel_presets:
+        used_ing_names = [i.item_name for i in swap_res.ingredients_used] + swap_res.prep_steps
+        is_violation, reason = check_meal_violation(
+            dish_name=swap_res.dish_name,
+            ingredients=used_ing_names,
+            active_presets=rel_presets,
+            day_name=day_obj.get("day", ""),
+        )
+        if is_violation:
+            return {
+                "success": False,
+                "message": f"Swap blocked by dietary policy: {reason}",
+                "plan_id": plan_id,
+                "plan": plan,
+                "served_by": served_by,
+            }
+
+    # 5. Apply the replacement to target slot
+    new_meal = {
+        "dish_name": swap_res.dish_name,
+        "prep_steps": swap_res.prep_steps,
+        "cook_time_minutes": swap_res.cook_time_minutes,
+        "changed_from": current_dish_name,
+    }
+    day_obj[slot] = new_meal
+
+    # Append new ingredient deductions to the day
+    new_deductions = [i.model_dump() for i in swap_res.ingredients_used]
+    current_deductions = day_obj.get("ingredients_to_deduct", [])
+    day_obj["ingredients_to_deduct"] = current_deductions + new_deductions
+
+    # 6. Save updated plan to database
+    update_saved_plan(plan_id, plan)
+
+    payload = latest_plan_payload()
+    payload["success"] = True
+    payload["message"] = f"Changed {slot.capitalize()} to {swap_res.dish_name} (from: {current_dish_name})"
+    payload["served_by"] = served_by
+    return payload
+
+
 # ---------- Shopping ----------
 
 
@@ -1027,6 +1758,17 @@ def api_restock(body: RestockRequest):
     payload = latest_plan_payload()
     payload["restocked"] = restocked
     payload["inventory"] = get_inventory()
+    return payload
+
+
+@app.post("/api/shopping/clear-purchased")
+def api_clear_purchased():
+    plan_id, _created_at, plan = get_latest_plan()
+    if plan_id is None or plan is None:
+        raise HTTPException(status_code=404, detail="No plan generated yet.")
+    cleared = clear_purchased_shopping_items(plan_id)
+    payload = latest_plan_payload()
+    payload["cleared"] = cleared
     return payload
 
 
@@ -1047,7 +1789,7 @@ def _active_shopping_list() -> list:
     return plan.get("shopping_list", []) if plan else []
 
 
-def _receipt_response(store_name: str, items: List[ReceiptLineItem]):
+def _receipt_response(store_name: str, items: List[ReceiptLineItem], served_by: str = ""):
     """Run the single inventory-update pass and build the shared response."""
     plan_id, _created_at, _plan = get_latest_plan()
     logs = process_scanned_receipt_items(plan_id, items)
@@ -1059,6 +1801,7 @@ def _receipt_response(store_name: str, items: List[ReceiptLineItem]):
         "plan_id": payload["plan_id"],
         "plan": payload["plan"],
         "inventory": get_inventory(),
+        "served_by": served_by,
     }
 
 
@@ -1071,12 +1814,10 @@ async def api_scan_receipt(request: Request):
     by normalized (item_name, quantity, unit) so overlapping screenshots of
     the same order don't double-count, before one inventory update pass.
     """
-    api_key = require_gemini_key(request)
+    keys = require_ai_keys(request)
     form = await request.form()
     uploads: List[UploadFile] = []
     for field_name, value in form.multi_items():
-        # NOTE: form parsing yields starlette UploadFiles; FastAPI's UploadFile
-        # is a subclass of it, so test against the starlette base class.
         if (
             field_name in ("files", "file")
             and isinstance(value, StarletteUploadFile)
@@ -1090,78 +1831,182 @@ async def api_scan_receipt(request: Request):
     merged: List[ReceiptLineItem] = []
     seen = set()
     store_name = "Grocery Store"
-    for upload in uploads:
-        image = await load_image(upload)
-        scan_res = gemini_call(analyze_grocery_receipt, api_key, image, active_shop_list)
-        if store_name == "Grocery Store" and scan_res.store_name:
-            store_name = scan_res.store_name
-        for item in scan_res.items:
-            dedupe_key = (
-                item.item_name.strip().lower(),
-                round(float(item.quantity), 2),
-                item.unit.strip().lower(),
-            )
-            if dedupe_key in seen:
-                continue
-            seen.add(dedupe_key)
-            merged.append(item)
-    return _receipt_response(store_name, merged)
+    try:
+        for upload in uploads:
+            image = await load_image(upload)
+            try:
+                scan_res, served_by = ai_call(analyze_grocery_receipt, keys, image, active_shop_list)
+                last_served_by = served_by
+                if store_name == "Grocery Store" and scan_res.store_name:
+                    store_name = scan_res.store_name
+                for item in scan_res.items:
+                    dedupe_key = (
+                        item.item_name.strip().lower(),
+                        round(float(item.quantity), 2),
+                        item.unit.strip().lower(),
+                    )
+                    if dedupe_key in seen:
+                        continue
+                    seen.add(dedupe_key)
+                    merged.append(item)
+            finally:
+                if hasattr(image, "close"):
+                    try:
+                        image.close()
+                    except Exception:
+                        pass
+    finally:
+        for upload in uploads:
+            try:
+                await upload.close()
+            except Exception:
+                pass
+    return _receipt_response(store_name, merged, last_served_by)
 
 
 @app.post("/api/receipt/scan-pdf")
 async def api_scan_receipt_pdf(request: Request, file: UploadFile = File(...)):
     """Import an online grocery order from a PDF (order confirmation/receipt)."""
-    api_key = require_gemini_key(request)
-    pdf_bytes = await file.read()
-    if not pdf_bytes:
-        raise HTTPException(status_code=400, detail="That PDF file was empty.")
-    scan_res = gemini_call(
-        analyze_receipt_pdf, api_key, pdf_bytes, _active_shopping_list()
-    )
-    return _receipt_response(scan_res.store_name, scan_res.items)
+    keys = require_ai_keys(request)
+    try:
+        pdf_bytes = await file.read()
+        if not pdf_bytes:
+            raise HTTPException(status_code=400, detail="That PDF file was empty.")
+        scan_res, served_by = ai_call(
+            analyze_receipt_pdf, keys, pdf_bytes, _active_shopping_list()
+        )
+        return _receipt_response(scan_res.store_name, scan_res.items, served_by)
+    finally:
+        try:
+            await file.close()
+        except Exception:
+            pass
 
 
 @app.post("/api/receipt/paste")
 def api_paste_receipt(body: ReceiptPasteRequest, request: Request):
     """Import an online grocery order from pasted confirmation text/email."""
-    api_key = require_gemini_key(request)
+    keys = require_ai_keys(request)
     text = (body.text or "").strip()
     if not text:
         raise HTTPException(
             status_code=400, detail="Paste your order or receipt text first."
         )
-    scan_res = gemini_call(
-        analyze_receipt_text, api_key, text, _active_shopping_list()
+    scan_res, served_by = ai_call(
+        analyze_receipt_text, keys, text, _active_shopping_list()
     )
-    return _receipt_response(scan_res.store_name, scan_res.items)
+    return _receipt_response(scan_res.store_name, scan_res.items, served_by)
 
 
 # ---------- Gemini key validation (per-user bring-your-own-key) ----------
 
 
+class ValidateProviderRequest(BaseModel):
+    provider: str = "gemini"
+    api_key: str = ""
+
+
+@app.post("/api/validate-provider")
+def api_validate_provider(body: ValidateProviderRequest, request: Request):
+    """Validate any supported AI provider key (Gemini, Groq, OpenRouter)."""
+    provider = body.provider.lower().strip()
+    key = body.api_key.strip()
+    if not key:
+        header_key = (
+            request.headers.get(f"x-{provider}-key")
+            or request.headers.get(f"X-{provider.capitalize()}-Key")
+            or ""
+        )
+        key = header_key.strip()
+    if not key:
+        raise HTTPException(
+            status_code=400, detail=f"No key provided. Paste your {provider.capitalize()} API key first."
+        )
+    ok, msg = validate_provider_key(provider, key)
+    if not ok:
+        return {"ok": False, "error": msg}
+    try:
+        cfg_file = os.environ.get("PANTRY_CONFIG_FILE", "pantry_desktop_config.json")
+        data = {}
+        if os.path.exists(cfg_file):
+            with open(cfg_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        if "provider_keys" not in data or not isinstance(data["provider_keys"], dict):
+            data["provider_keys"] = {}
+        data["provider_keys"][provider] = key
+        with open(cfg_file, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except Exception:
+        pass
+    return {"ok": True, "message": msg}
+
+
 @app.post("/api/validate-key")
 def api_validate_key(request: Request):
-    """Validate a user-supplied Gemini key with one tiny test call.
-
-    The key arrives in the X-Gemini-Key header, is used for a single
-    minimal generateContent call against Google, and is never stored
-    or logged by the backend.
-    """
+    """Validate a user-supplied Gemini key (backward compatible endpoint)."""
     api_key = request.headers.get("x-gemini-key") or ""
     if not api_key:
         raise HTTPException(
             status_code=400, detail="No key provided. Paste your Gemini API key first."
         )
+    ok, msg = validate_provider_key("gemini", api_key)
+    if not ok:
+        return {"ok": False, "error": f"That key didn't work — {msg}"}
     try:
-        client = get_client(api_key)
-        client.models.generate_content(
-            model="gemini-3.8-flash",
-            contents="ping",
-            config=types.GenerateContentConfig(max_output_tokens=16, temperature=0),
-        )
-    except Exception as e:
-        return {"ok": False, "error": f"That key didn't work — Google rejected it. ({e})"}
+        cfg_file = os.environ.get("PANTRY_CONFIG_FILE", "pantry_desktop_config.json")
+        data = {}
+        if os.path.exists(cfg_file):
+            with open(cfg_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        if "provider_keys" not in data or not isinstance(data["provider_keys"], dict):
+            data["provider_keys"] = {}
+        data["provider_keys"]["gemini"] = api_key
+        with open(cfg_file, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except Exception:
+        pass
     return {"ok": True, "message": "Key works! You're connected."}
+
+
+# ---------- Provider Resilience & Health Watchdog ----------
+
+LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost", "testclient"}
+
+
+class SaveProviderModelRequest(BaseModel):
+    provider: str
+    model: str
+
+
+@app.get("/api/providers/status")
+def api_get_providers_status(request: Request):
+    """Retrieve persisted status of AI providers. Connected phones receive sanitized health words."""
+    client_is_phone = False
+    if request.client and request.client.host not in LOOPBACK_HOSTS:
+        client_is_phone = True
+    return get_providers_status(client_is_phone=client_is_phone)
+
+
+@app.post("/api/providers/status/check")
+def api_check_providers_status(request: Request):
+    """Run an on-demand probe of all configured providers."""
+    client_is_phone = False
+    if request.client and request.client.host not in LOOPBACK_HOSTS:
+        client_is_phone = True
+    probe_all_providers()
+    return get_providers_status(client_is_phone=client_is_phone)
+
+
+@app.post("/api/providers/model")
+def api_save_provider_model(body: SaveProviderModelRequest, request: Request):
+    """Update a provider's model ID with validation probe."""
+    ok, msg, probe_data = save_provider_model_with_validation(
+        provider=body.provider,
+        candidate_model=body.model,
+    )
+    if not ok:
+        return {"ok": False, "error": msg, "details": probe_data}
+    return {"ok": True, "provider": body.provider, "model": body.model, "message": msg}
 
 
 # ---------- Static PWA (mounted last so /api routes win) ----------

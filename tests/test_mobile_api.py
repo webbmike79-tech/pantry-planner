@@ -1,0 +1,522 @@
+"""
+Tests for pantry-planner mobile FastAPI backend using unittest.
+Verifies CORS headers, health endpoint, inventory routes, and DB isolation.
+"""
+
+import os
+import tempfile
+import unittest
+from starlette.testclient import TestClient
+
+# Set temporary DB before importing api.main
+temp_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+temp_db.close()
+os.environ["PANTRY_DB_FILE"] = temp_db.name
+
+from api.main import app, init_db
+
+
+class TestMobileApi(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.client = TestClient(app)
+
+    def setUp(self):
+        import sqlite3
+        from api.main import DB_FILE
+        init_db()
+        conn = sqlite3.connect(DB_FILE)
+        conn.execute("DELETE FROM inventory")
+        conn.execute("DELETE FROM saved_plans")
+        conn.commit()
+        conn.close()
+
+    @classmethod
+    def tearDownClass(cls):
+        try:
+            if os.path.exists(temp_db.name):
+                os.unlink(temp_db.name)
+        except Exception:
+            pass
+
+    def test_health_endpoint(self):
+        res = self.client.get("/health")
+        self.assertEqual(res.status_code, 200)
+        data = res.json()
+        self.assertEqual(data["status"], "ok")
+        self.assertEqual(data["app"], "pantry-planner")
+
+    def test_cors_headers_localhost(self):
+        res = self.client.options(
+            "/api/inventory",
+            headers={
+                "Origin": "http://localhost:8000",
+                "Access-Control-Request-Method": "GET",
+            },
+        )
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.headers.get("access-control-allow-origin"), "http://localhost:8000")
+
+    def test_cors_headers_capacitor(self):
+        res = self.client.options(
+            "/api/inventory",
+            headers={
+                "Origin": "capacitor://localhost",
+                "Access-Control-Request-Method": "POST",
+            },
+        )
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.headers.get("access-control-allow-origin"), "capacitor://localhost")
+
+    def test_cors_headers_lan_ip(self):
+        res = self.client.options(
+            "/api/inventory",
+            headers={
+                "Origin": "http://192.168.4.159:8000",
+                "Access-Control-Request-Method": "GET",
+            },
+        )
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.headers.get("access-control-allow-origin"), "http://192.168.4.159:8000")
+
+    def test_inventory_crud_and_add(self):
+        # 1. Clear inventory
+        res = self.client.delete("/api/inventory?confirm_clear=true")
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.json()["inventory"], [])
+
+        # 2. Add item via POST /api/inventory (hand-add / outbox format)
+        res = self.client.post(
+            "/api/inventory",
+            json={
+                "location": "Fridge",
+                "items": [
+                    {
+                        "item_name": "Organic Milk",
+                        "category": "Dairy",
+                        "quantity": 1.0,
+                        "unit": "gallon",
+                    }
+                ],
+            },
+        )
+        self.assertEqual(res.status_code, 200)
+        data = res.json()
+        self.assertEqual(data["added"], 1)
+        self.assertEqual(len(data["inventory"]), 1)
+        item = data["inventory"][0]
+        self.assertEqual(item["item_name"], "Organic Milk")
+        self.assertEqual(item["location"], "Fridge")
+        self.assertEqual(item["quantity"], 1.0)
+
+        # 3. Add second item
+        res = self.client.post(
+            "/api/inventory",
+            json={
+                "location": "Cupboard / Pantry",
+                "items": [
+                    {
+                        "item_name": "Rolled Oats",
+                        "category": "Pantry/Dry",
+                        "quantity": 2.5,
+                        "unit": "lbs",
+                    }
+                ],
+            },
+        )
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(len(res.json()["inventory"]), 2)
+
+        # 4. Get inventory
+        res = self.client.get("/api/inventory")
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(len(res.json()), 2)
+
+        # 5. Bulk replace via PUT /api/inventory
+        res = self.client.put(
+            "/api/inventory",
+            json=[
+                {
+                    "id": 1,
+                    "location": "Fridge",
+                    "item_name": "Almond Milk",
+                    "category": "Dairy",
+                    "quantity": 0.5,
+                    "unit": "carton",
+                }
+            ],
+        )
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(len(res.json()["inventory"]), 1)
+        self.assertEqual(res.json()["inventory"][0]["item_name"], "Almond Milk")
+
+    def test_clear_purchased_shopping(self):
+        # 404 when no plan
+        res = self.client.post("/api/shopping/clear-purchased")
+        self.assertEqual(res.status_code, 404)
+
+        # Now save a plan with shopping items
+        from api.main import save_plan
+        test_plan = {
+            "menu": [],
+            "shopping_list": [
+                {"item_name": "Milk", "purchased": True, "amount_needed": "1 gallon"},
+                {"item_name": "Eggs", "purchased": False, "amount_needed": "1 doz"},
+            ],
+        }
+        save_plan(test_plan)
+
+        res = self.client.post("/api/shopping/clear-purchased")
+        self.assertEqual(res.status_code, 200)
+        data = res.json()
+        self.assertEqual(data["cleared"], 1)
+        # Verify only unpurchased item remains
+        remaining = data["plan"]["shopping_list"]
+        self.assertEqual(len(remaining), 1)
+        self.assertEqual(remaining[0]["item_name"], "Eggs")
+
+
+    def test_scan_request_succeeds_using_server_keys_when_client_sends_no_key(self):
+        """Connected client with no key headers succeeds when server has env provider keys configured."""
+        from unittest.mock import patch
+        import io
+        from PIL import Image
+
+        # Ensure server has an env key configured
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "server-env-key-12345"}):
+            with patch("api.ai_fallback._call_gemini") as mock_gemini:
+                mock_gemini.return_value = '{"items": [{"item_name": "Milk", "category": "Dairy", "quantity": 1.0, "unit": "gallon"}]}'
+
+                # Create dummy image bytes
+                img = Image.new("RGB", (32, 32), color="blue")
+                buf = io.BytesIO()
+                img.save(buf, format="JPEG")
+                buf.seek(0)
+
+                # Client sends NO x-gemini-key, x-groq-key, or x-openrouter-key headers
+                res = self.client.post(
+                    "/api/scan-photo",
+                    data={"location": "Fridge"},
+                    files={"file": ("shelf.jpg", buf, "image/jpeg")},
+                )
+                self.assertEqual(res.status_code, 200)
+                data = res.json()
+                self.assertEqual(data["added"], 1)
+                self.assertEqual(data["served_by"], "gemini")
+                self.assertEqual(data["items"][0]["item_name"], "Milk")
+
+    def test_fresh_db_boot_all_lists_empty(self):
+        """Fresh database boot: inventory empty, saved_plans empty, latest plan payload returns None."""
+        from api.main import get_inventory, get_latest_plan, latest_plan_payload
+        # Verify direct DB functions
+        self.assertEqual(get_inventory(), [])
+        plan_id, created_at, plan = get_latest_plan()
+        self.assertIsNone(plan_id)
+        self.assertIsNone(created_at)
+        self.assertIsNone(plan)
+
+        # Verify API endpoints
+        inv_res = self.client.get("/api/inventory")
+        self.assertEqual(inv_res.status_code, 200)
+        self.assertEqual(inv_res.json(), [])
+
+        plan_res = self.client.get("/api/plan/latest")
+        self.assertEqual(plan_res.status_code, 200)
+        self.assertEqual(plan_res.json(), {"plan_id": None, "created_at": None, "plan": None})
+
+    def test_existing_db_boot_inventory_and_settings_preserved(self):
+        """Upgrade safety: existing inventory and settings survive untouched across init_db."""
+        import sqlite3
+        from api.main import DB_FILE, init_db, get_inventory, get_settings, add_inventory_items, DetectedItem
+
+        # Add existing user inventory and customize settings
+        add_inventory_items("Fridge", [
+            DetectedItem(item_name="Ground Beef", category="Protein", quantity=2.0, unit="lbs")
+        ])
+        conn = sqlite3.connect(DB_FILE)
+        conn.execute("UPDATE settings SET base_headcount = 4 WHERE id = 1")
+        conn.commit()
+        conn.close()
+
+        # Re-run init_db (simulating app boot/upgrade on existing database)
+        init_db()
+
+        inv = get_inventory()
+        self.assertEqual(len(inv), 1)
+        self.assertEqual(inv[0]["item_name"], "Ground Beef")
+        self.assertEqual(inv[0]["quantity"], 2.0)
+
+        settings = get_settings()
+        self.assertEqual(settings["base_headcount"], 4)
+
+    def test_plan_menu_shopping_list_contains_only_plan_minus_inventory(self):
+        """When menu plan is saved, shopping list derives strictly from the saved plan and contains only needed items."""
+        from api.main import save_plan, get_latest_plan, latest_plan_payload
+
+        # Save a plan where 2 items are needed (e.g. Avocado and Sourdough Bread)
+        test_plan = {
+            "menu": [
+                {
+                    "day": "Monday",
+                    "headcount": 2,
+                    "breakfast": {"dish_name": "Avocado Toast", "cook_time_minutes": 10, "prep_steps": ["Toast bread", "Mash avocado"]},
+                    "lunch": None,
+                    "dinner": None,
+                    "ingredients_to_deduct": [],
+                    "cooked": False,
+                }
+            ],
+            "shopping_list": [
+                {
+                    "item_name": "Avocados",
+                    "category": "Veggies & Produce",
+                    "amount_needed": "2 count",
+                    "numeric_quantity": 2.0,
+                    "unit": "count",
+                    "default_location": "Fridge",
+                    "inventory_category": "Produce/Veggies",
+                    "reason": "For Monday breakfast",
+                    "purchased": False,
+                },
+                {
+                    "item_name": "Sourdough Bread",
+                    "category": "Pantry/Dry",
+                    "amount_needed": "1 loaf",
+                    "numeric_quantity": 1.0,
+                    "unit": "loaf",
+                    "default_location": "Cupboard / Pantry",
+                    "inventory_category": "Pantry/Dry",
+                    "reason": "For Monday breakfast",
+                    "purchased": False,
+                },
+            ],
+            "nutrition_notes": "Whole food balanced breakfast",
+        }
+        save_plan(test_plan)
+
+        payload = latest_plan_payload()
+        self.assertIsNotNone(payload["plan_id"])
+        self.assertIsNotNone(payload["plan"])
+        shop_items = [i["item_name"] for i in payload["plan"]["shopping_list"]]
+        self.assertEqual(shop_items, ["Avocados", "Sourdough Bread"])
+
+    def test_swap_meal_changes_only_target_slot_and_records_changed_from(self):
+        """Meal swap changes only target slot, preserves other meals/shopping, and records changed_from."""
+        from unittest.mock import patch
+        from api.main import save_plan, add_inventory_items, DetectedItem, MealSwapOutput, UsedIngredient
+
+        # Seed inventory with on-hand items: Eggs and Cheese
+        add_inventory_items("Fridge", [
+            DetectedItem(item_name="Eggs", category="Protein", quantity=12.0, unit="count"),
+            DetectedItem(item_name="Cheddar Cheese", category="Dairy", quantity=8.0, unit="oz"),
+        ])
+
+        # Save an initial plan with Monday breakfast
+        initial_plan = {
+            "menu": [
+                {
+                    "day": "Monday",
+                    "headcount": 2,
+                    "breakfast": {"dish_name": "Oatmeal with Berries", "cook_time_minutes": 10, "prep_steps": ["Boil oats"]},
+                    "lunch": {"dish_name": "Turkey Wrap", "cook_time_minutes": 5, "prep_steps": ["Roll wrap"]},
+                    "dinner": {"dish_name": "Baked Salmon", "cook_time_minutes": 25, "prep_steps": ["Bake salmon"]},
+                    "ingredients_to_deduct": [],
+                    "cooked": False,
+                }
+            ],
+            "shopping_list": [
+                {"item_name": "Salmon", "amount_needed": "1 lb", "numeric_quantity": 1.0, "unit": "lb", "purchased": False}
+            ],
+            "nutrition_notes": "Balanced meals",
+        }
+        save_plan(initial_plan)
+
+        mock_swap = MealSwapOutput(
+            found=True,
+            dish_name="Cheese Omelet",
+            prep_steps=["Whisk eggs", "Melt cheese in pan"],
+            cook_time_minutes=12,
+            ingredients_used=[
+                UsedIngredient(inventory_id=1, item_name="Eggs", amount_used=4.0, unit="count"),
+                UsedIngredient(inventory_id=2, item_name="Cheddar Cheese", amount_used=2.0, unit="oz"),
+            ],
+        )
+
+        with patch("api.main.swap_single_meal", return_value=(mock_swap, "gemini")):
+            res = self.client.post(
+                "/api/plan/swap-meal",
+                json={"day_index": 0, "meal_slot": "breakfast"},
+                headers={"X-Gemini-Key": "dummy-key"},
+            )
+            self.assertEqual(res.status_code, 200)
+            data = res.json()
+            self.assertTrue(data["success"])
+            self.assertEqual(data["served_by"], "gemini")
+
+            updated_menu = data["plan"]["menu"]
+            # Target slot changed
+            self.assertEqual(updated_menu[0]["breakfast"]["dish_name"], "Cheese Omelet")
+            self.assertEqual(updated_menu[0]["breakfast"]["changed_from"], "Oatmeal with Berries")
+            # Other meals in the week untouched
+            self.assertEqual(updated_menu[0]["lunch"]["dish_name"], "Turkey Wrap")
+            self.assertEqual(updated_menu[0]["dinner"]["dish_name"], "Baked Salmon")
+            # Shopping list untouched
+            self.assertEqual(len(data["plan"]["shopping_list"]), 1)
+            self.assertEqual(data["plan"]["shopping_list"][0]["item_name"], "Salmon")
+
+    def test_swap_meal_no_on_hand_leaves_original_meal_untouched(self):
+        """When no on-hand alternative satisfies the rules, original meal is left in place."""
+        from unittest.mock import patch
+        from api.main import save_plan, MealSwapOutput
+
+        initial_plan = {
+            "menu": [
+                {
+                    "day": "Monday",
+                    "headcount": 2,
+                    "breakfast": {"dish_name": "Pancakes", "cook_time_minutes": 15, "prep_steps": ["Mix batter"]},
+                    "lunch": None,
+                    "dinner": None,
+                    "ingredients_to_deduct": [],
+                    "cooked": False,
+                }
+            ],
+            "shopping_list": [],
+            "nutrition_notes": "Standard",
+        }
+        save_plan(initial_plan)
+
+        # Inventory is empty, so swap_meal should report not found
+        res = self.client.post(
+            "/api/plan/swap-meal",
+            json={"day_index": 0, "meal_slot": "breakfast"},
+            headers={"X-Gemini-Key": "dummy-key"},
+        )
+        self.assertEqual(res.status_code, 200)
+        data = res.json()
+        self.assertFalse(data["success"])
+        self.assertEqual(data["message"], "Nothing else on hand fits this slot")
+        # Meal is untouched
+        self.assertEqual(data["plan"]["menu"][0]["breakfast"]["dish_name"], "Pancakes")
+        self.assertIsNone(data["plan"]["menu"][0]["breakfast"].get("changed_from"))
+
+    def test_clear_plan_deletes_saved_plan_without_touching_inventory_or_settings(self):
+        """DELETE /api/plan deletes the plan and shopping list while leaving inventory and settings untouched."""
+        from api.main import save_plan, get_latest_plan, get_inventory, get_settings, add_inventory_items, DetectedItem
+
+        # 1. Populate inventory
+        add_inventory_items("Fridge", [DetectedItem(item_name="Almond Milk", quantity=1.0, unit="bottle", category="Dairy")])
+        initial_inv = get_inventory()
+        self.assertEqual(len(initial_inv), 1)
+
+        # 2. Populate plan with shopping list
+        initial_plan = {
+            "menu": [
+                {
+                    "day": "Monday",
+                    "headcount": 2,
+                    "breakfast": {"dish_name": "Oatmeal", "changed_from": "Toast"},
+                    "lunch": None,
+                    "dinner": None,
+                    "ingredients_to_deduct": [],
+                    "cooked": False,
+                }
+            ],
+            "shopping_list": [{"item_name": "Oats", "quantity": 1, "unit": "can", "category": "Pantry/Dry", "purchased": False}],
+            "nutrition_notes": "Healthy",
+        }
+        save_plan(initial_plan)
+        p_id, _, p_data = get_latest_plan()
+        self.assertIsNotNone(p_id)
+        self.assertIsNotNone(p_data)
+
+        # 3. Call DELETE /api/plan
+        res = self.client.delete("/api/plan")
+        self.assertEqual(res.status_code, 200)
+        data = res.json()
+        self.assertIsNone(data["plan_id"])
+        self.assertIsNone(data["plan"])
+
+        # 4. Verify plan is gone in DB
+        check_id, _, check_plan = get_latest_plan()
+        self.assertIsNone(check_id)
+        self.assertIsNone(check_plan)
+
+        # 5. Verify inventory and settings were untouched
+        inv_after = get_inventory()
+        self.assertEqual(len(inv_after), 1)
+        self.assertEqual(inv_after[0]["item_name"], "Almond Milk")
+
+    def test_inventory_destructive_ops_confirm_clear(self):
+        """Part 3.3 server enforcement:
+        - Empty replace without confirm_clear -> rejected (400) and inventory unchanged.
+        - Empty replace with confirm_clear=true -> succeeds (200) and inventory emptied.
+        - Non-empty replace -> succeeds (200) without confirm_clear.
+        - DELETE /api/inventory without confirm_clear -> rejected (400) and inventory unchanged.
+        - DELETE /api/inventory with confirm_clear=true -> succeeds (200) and inventory emptied.
+        """
+        # 1. Populate initial inventory with an item
+        add_res = self.client.post("/api/inventory", json={
+            "location": "Fridge",
+            "items": [{"item_name": "Pasta", "quantity": 2.0, "unit": "box", "category": "Pantry"}]
+        })
+        self.assertEqual(add_res.status_code, 200)
+        inv = self.client.get("/api/inventory").json()
+        self.assertEqual(len(inv), 1)
+        self.assertEqual(inv[0]["item_name"], "Pasta")
+
+        # 2. Empty replace WITHOUT confirm_clear -> rejected (400) + inventory unchanged
+        empty_res = self.client.put("/api/inventory", json=[])
+        self.assertEqual(empty_res.status_code, 400)
+        self.assertIn("confirm_clear", empty_res.json()["detail"])
+        inv = self.client.get("/api/inventory").json()
+        self.assertEqual(len(inv), 1)
+        self.assertEqual(inv[0]["item_name"], "Pasta")
+
+        # 3. DELETE /api/inventory WITHOUT confirm_clear -> rejected (400) + inventory unchanged
+        del_res = self.client.delete("/api/inventory")
+        self.assertEqual(del_res.status_code, 400)
+        self.assertIn("confirm_clear", del_res.json()["detail"])
+        inv = self.client.get("/api/inventory").json()
+        self.assertEqual(len(inv), 1)
+
+        # 4. Normal non-empty replace -> succeeds (200) without confirm_clear
+        item_id = inv[0]["id"]
+        replace_res = self.client.put("/api/inventory", json=[
+            {
+                "id": item_id,
+                "location": "Fridge",
+                "item_name": "Apples",
+                "quantity": 5.0,
+                "unit": "count",
+                "category": "Produce",
+                "updated_at": "2026-10-19T00:00:00"
+            }
+        ])
+        self.assertEqual(replace_res.status_code, 200)
+        inv = self.client.get("/api/inventory").json()
+        self.assertEqual(len(inv), 1)
+        self.assertEqual(inv[0]["item_name"], "Apples")
+
+        # 5. Empty replace WITH confirm_clear=true -> succeeds (200)
+        empty_confirm_res = self.client.put("/api/inventory?confirm_clear=true", json=[])
+        self.assertEqual(empty_confirm_res.status_code, 200)
+        self.assertEqual(len(self.client.get("/api/inventory").json()), 0)
+
+        # Repopulate item
+        self.client.post("/api/inventory", json={
+            "location": "Fridge",
+            "items": [{"item_name": "Rice", "quantity": 1.0, "unit": "bag", "category": "Pantry"}]
+        })
+        self.assertEqual(len(self.client.get("/api/inventory").json()), 1)
+
+        # 6. DELETE /api/inventory WITH confirm_clear=true -> succeeds (200)
+        del_confirm_res = self.client.delete("/api/inventory?confirm_clear=true")
+        self.assertEqual(del_confirm_res.status_code, 200)
+        self.assertEqual(len(self.client.get("/api/inventory").json()), 0)
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+

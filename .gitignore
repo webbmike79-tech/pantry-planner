@@ -2,6 +2,18 @@
 __pycache__/
 *.pyc
 pantry_planner.db
+pantry_providers_status.json
+node_modules/
+.gradle/
+android/.gradle/
+android/app/build/
+android/build/
+android/local.properties
+android/captures/
+*.apk
+tests/fixtures/vision/*.jpg
+tests/fixtures/vision/*.jpeg
+tests/fixtures/vision/*.png
 
 # Secrets and local data (added 2026-10-16)
 .env
